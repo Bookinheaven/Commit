@@ -4,7 +4,19 @@ import urllib.error
 from . import config
 from .parser import clean_title, clean_description
 
-def ask_ollama(prompt, system="", max_tokens=100):
+
+def check_ollama() -> None:
+    """Quick connectivity check — raises RuntimeError if Ollama isn't reachable."""
+    base = config.OLLAMA_URL.split("/api/")[0]
+    try:
+        urllib.request.urlopen(base, timeout=4)
+    except urllib.error.URLError:
+        raise RuntimeError(
+            "Cannot reach Ollama at: " + base + "\n"
+            "Make sure Ollama is running:  ollama serve"
+        )
+
+def ask_ollama(prompt, system="", max_tokens=100, _retry=True):
     payload = {
         "model": config.MODEL,
         "prompt": prompt,
@@ -31,6 +43,9 @@ def ask_ollama(prompt, system="", max_tokens=100):
         with urllib.request.urlopen(request, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as e:
+        if _retry:
+            print("\r  Request timed out — retrying once...", flush=True)
+            return ask_ollama(prompt, system, max_tokens, _retry=False)
         raise RuntimeError(
             "Could not connect to Ollama.\n"
             "Make sure Ollama is running."

@@ -1,59 +1,107 @@
 # AI Git Commit Generator
 
-A powerful, intelligent, and zero-dependency Git commit generator powered by local LLMs (via [Ollama](https://ollama.com/)). It analyzes your staged files and generates highly structured, professional Conventional Commit messages.
+Generate structured, professional [Conventional Commit](https://www.conventionalcommits.org/) messages from your staged changes — powered by a local LLM via [Ollama](https://ollama.com/). No internet required.
 
-## Features
+## Requirements
 
-- **Local & Private**: Runs entirely locally using Ollama. No data is sent to external APIs.
-- **Map-Reduce Architecture**: Intelligently handles massive diffs (up to hundreds of thousands of characters) by splitting them by file, filtering out noise (`package-lock.json`, minified assets), summarizing chunks, and synthesizing a final cohesive commit.
-- **Semantic Grouping**: It doesn't just list what files changed. It analyzes the technical context, groups related components, APIs, and database changes together, and outputs a semantic summary of the feature.
-- **Conventional Commits**: Automatically detects the correct type (`feat`, `fix`, `refactor`, `chore`, etc.) and determines the correct scope.
-- **Beautiful Terminal UI**: Features a clean, colorful ANSI terminal interface for previewing, regenerating, or manually editing your commit messages.
-- **Zero Dependencies**: Built entirely with Python standard libraries. Just install Python and run it!
+- Python 3.8+
+- Git
+- [Ollama](https://ollama.com/) running locally
 
-## Prerequisites
+Pull the default model before first use:
 
-1. **Python 3.8+**
-2. **Git**
-3. **Ollama**: You must have Ollama installed and running on your local machine.
-
-The script defaults to using the `qwen2.5-coder:7b` model. Make sure you have pulled it:
 ```bash
-ollama run qwen2.5-coder:7b
+ollama pull qwen2.5-coder:7b
+```
+
+## Setup
+
+Clone or copy this repo anywhere on your machine. No installation needed — it's just Python.
+
+```
+Commit/
+├── commit.py           ← main script
+├── commit.bat          ← Windows shortcut
+├── commit_history.json ← auto-created after first commit
+└── core/
+    ├── config.py       ← model & settings
+    ├── llm.py          ← Ollama calls & prompts
+    ├── parser.py       ← diff parsing & cleanup
+    ├── git_utils.py    ← git subprocess wrappers
+    ├── ui.py           ← terminal output & editor
+    └── history.py      ← commit history logger
 ```
 
 ## Usage
 
-1. Stage the files you want to commit using standard Git commands:
-   ```bash
-   git add src/ app/
-   ```
+### Option 1 — Add to PATH (recommended)
 
-2. Run the commit generator:
-   ```bash
-   python /path/to/Commit/commit.py
-   ```
+Add the `Commit/` folder to your system `PATH`. Then from any Git repo:
 
-3. The script will analyze your staged changes and present a preview:
-   - **[Y] Commit**: Accept the generated message and commit immediately.
-   - **[E] Edit**: Opens the generated message in your default text editor (`$EDITOR` or Notepad/Nano) so you can make manual adjustments.
-   - **[R] Regenerate**: Ask the AI to write a completely new title and description.
-   - **[N] Cancel**: Abort the commit.
+```bash
+git add .
+commit
+```
+
+### Option 2 — Run directly
+
+```bash
+git add src/ app/
+python C:\path\to\Commit\commit.py
+```
+
+### Option 3 — Double-click or call the `.bat`
+
+```bat
+commit.bat
+```
+
+## What it does on each run
+
+1. **Checks Ollama** is reachable before doing anything
+2. **Lists your staged files** so you know exactly what's being analyzed
+3. **Generates** a title and description using the LLM (animated spinner while waiting)
+4. **Shows a preview** with an interactive menu
+
+## Interactive Menu
+
+| Key | Action |
+|-----|--------|
+| `Y` | Accept and commit |
+| `E` | Open in editor (`$EDITOR`, Notepad, or nano) |
+| `R` | Regenerate a new message |
+| `N` | Cancel without committing |
+
+## Commit History
+
+Every successful commit is appended to `commit_history.json` in the tool's directory:
+
+```json
+[
+  {
+    "timestamp": "2026-10-16T09:45:00",
+    "repo": "D:/GitHub/MyProject",
+    "title": "feat(auth): add session-based login",
+    "description": "Implements cookie-based sessions...\n\n- Add login/logout endpoints\n- ..."
+  }
+]
+```
 
 ## Configuration
 
-You can easily change the model or tweak the diff size limits by modifying `core/config.py`:
+Edit [`core/config.py`](core/config.py):
 
 ```python
-MODEL = "qwen2.5-coder:7b"
+MODEL = "qwen2.5-coder:7b"   # any model available in Ollama
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MAX_DIFF_CHARS = 20000
+MAX_DIFF_CHARS = 20000        # diffs larger than this trigger Map-Reduce mode
 ```
 
-## How It Works (Large Diffs)
+## Large Diffs
 
-When you stage a massive change (e.g., thousands of lines), the generator automatically switches into **Map-Reduce** mode:
-1. **Noise Filtering**: Automatically drops the content of auto-generated files (lockfiles, maps, minified scripts) so they don't pollute the AI's context.
-2. **Chunking**: Splits the remaining diff into optimal chunks without breaking files in half.
-3. **Mapping**: Asks the LLM to write 1-3 bullet points summarizing each chunk.
-4. **Reducing**: Combines the summaries and asks the LLM to synthetically group them into a maximum of 5 high-level logical features.
+For large staged changes the tool automatically switches to **Map-Reduce** mode:
+
+1. **Filter** — drops auto-generated files (`package-lock.json`, lockfiles, `.min.js`, etc.)
+2. **Split** — divides the remaining diff into chunks without breaking files apart
+3. **Summarise** — asks the model to bullet-point each chunk (with per-chunk spinner)
+4. **Synthesise** — combines summaries into one coherent commit message

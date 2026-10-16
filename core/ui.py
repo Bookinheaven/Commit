@@ -2,6 +2,9 @@ import os
 import sys
 import tempfile
 import subprocess
+import threading
+import itertools
+import time
 from .git_utils import run_git
 
 class Theme:
@@ -40,9 +43,44 @@ class Theme:
     def print_dim(text):
         print(f"{Theme.DIM}{text}{Theme.RESET}")
 
+class Spinner:
+    """Context manager that shows an animated spinner on one line."""
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message: str = ""):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        for frame in itertools.cycle(self._FRAMES):
+            if self._stop.is_set():
+                break
+            print(f"\r{Theme.CYAN}{frame} {self.message}{Theme.RESET}",
+                  end="", flush=True)
+            time.sleep(0.08)
+        # Clear the spinner line
+        print(f"\r{' ' * (len(self.message) + 4)}\r", end="", flush=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join()
+
+
 # For Windows we need to enable ANSI colors
 if os.name == 'nt':
     os.system('color')
+
+def display_staged_files(files: list[str]) -> None:
+    """Print a compact list of staged files before generation."""
+    Theme.print_header("Staged Files")
+    for f in files:
+        print(f"  {Theme.DIM}·{Theme.RESET} {f}")
+    print()
 
 
 def display_commit(title, description):
