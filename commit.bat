@@ -1,2 +1,2 @@
 @echo off
-python "%~dp0commit.py"
+python "%~dp0commit.py" %*

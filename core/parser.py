@@ -3,7 +3,7 @@ import re
 
 NOISE_FILES = (
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", 
-    "poetry.lock", "Cargo.lock", "Gemfile.lock",
+    "poetry.lock", "Cargo.lock", "Gemfile.lock", "bun.lockb", "composer.lock",
     ".svg", ".min.js", ".min.css", ".map"
 )
 
@@ -77,6 +77,116 @@ def batch_file_diffs(file_diffs, max_chars):
         
     return batches
 
+def clean_desc_case(desc: str) -> str:
+    """Ensure the description starts with lowercase unless it is an acronym or proper noun."""
+    if not desc:
+        return ""
+    first_word = desc.split()[0]
+    if first_word.isupper() or first_word in ("Git", "Ollama", "Python", "Linux", "Windows", "CLI", "API", "URL", "JSON"):
+        return desc
+    return desc[0].lower() + desc[1:]
+
+
+def sanitize_title_scope(title: str) -> str:
+    """Sanitize bloated scopes (e.g. multiple comma-separated files or file extensions)."""
+    m = re.match(r"^([a-z]+)\s*\(([^)]+)\)\s*:\s*(.*)$", title, re.IGNORECASE)
+    if not m:
+        return title
+
+    ctype = m.group(1).lower()
+    raw_scope = m.group(2).strip()
+    desc = clean_desc_case(m.group(3).strip())
+
+    # If scope contains commas, spaces, slashes, or extensions, it is a file list or invalid
+    if any(sep in raw_scope for sep in (",", ";", "/", "\\", " ")):
+        return f"{ctype}: {desc}"
+
+    # Strip common file extensions if single file name provided, e.g. (commit.py) -> (commit)
+    clean_scope = re.sub(r"\.[a-zA-Z0-9]+$", "", raw_scope).strip().lower()
+
+    # Scope must be a clean short identifier (2 to 12 alphanumeric/dash chars)
+    if re.match(r"^[a-z0-9_-]{2,12}$", clean_scope):
+        return f"{ctype}({clean_scope}): {desc}"
+
+    return f"{ctype}: {desc}"
+
+
+def truncate_title(title: str, max_len: int = 70) -> str:
+    """Intelligently shorten long titles at clean word boundaries or compound clauses."""
+    if len(title) <= max_len:
+        return title
+
+    # Look for compound conjunctions or commas to split into a complete single clause
+    for delim in (" and ", " with ", ", "):
+        pos = title.rfind(delim)
+        while pos > 28:
+            candidate = title[:pos].rstrip(" ,-:")
+            if len(candidate) <= max_len:
+                return candidate
+            pos = title.rfind(delim, 0, pos)
+
+    # Otherwise cut at word boundary before max_len
+    sub = title[:max_len]
+    last_space = sub.rfind(" ")
+    if last_space > 25:
+        sub = sub[:last_space]
+
+    for trailing in (" and", " with", " for", " to", " of", " in", " on", " by", ",", "-", ":", ";", "."):
+        if sub.endswith(trailing):
+            sub = sub[:-len(trailing)].strip()
+
+    return sub
+
+
+def clean_title_line(line: str) -> str:
+    """Strip markdown formatting, bold, headers, bullets, and title prefixes."""
+    line = line.strip()
+    if not line:
+        return ""
+
+    # Remove code blocks and inline backticks
+    line = line.replace("```", "").replace("`", "").strip()
+
+    # Remove bold and italic markers completely from title
+    line = line.replace("**", "").replace("__", "").strip()
+
+    # Strip markdown headers (#, ##, etc.)
+    line = re.sub(r"^#+\s*", "", line).strip()
+
+    # Strip leading bullet/list markers (e.g. '- ', '* ', '1. ')
+    line = re.sub(r"^(\*|-|\d+\.)\s+", "", line).strip()
+
+    # Strip common title prefixes
+    prefixes = (
+        "commit title:", "title:", "commit message:", "commit:", "subject:", "summary:"
+    )
+    for p in prefixes:
+        if line.lower().startswith(p):
+            line = line[len(p):].strip()
+
+    # Strip accidental surrounding quotes
+    if len(line) >= 2 and line[0] == line[-1] and line[0] in ('"', "'"):
+        line = line[1:-1].strip()
+
+    # Clean any trailing punctuation, asterisks, or whitespace
+    cleaned = line.strip("*_` ").rstrip(".").strip()
+
+    # Sanitize bloated scope
+    cleaned = sanitize_title_scope(cleaned)
+
+    # Format description case after colon
+    colon_idx = cleaned.find(":")
+    if colon_idx != -1:
+        prefix = cleaned[:colon_idx + 1]
+        desc = cleaned[colon_idx + 1:].strip()
+        cleaned = f"{prefix} {clean_desc_case(desc)}"
+
+    # Ensure title fits within recommended length
+    cleaned = truncate_title(cleaned)
+
+    return cleaned
+
+
 def clean_title(response):
     """
     Extract a usable commit title from the model response.
@@ -104,29 +214,26 @@ def clean_title(response):
         "chore:", "chore(", "build:", "build(", "ci:", "ci("
     )
 
-    for line in response.splitlines():
-        line = line.strip()
+    first_candidate = ""
 
-        if not line:
+    for line in response.splitlines():
+        candidate = clean_title_line(line)
+        if not candidate:
             continue
 
-        # Remove common Markdown formatting.
-        line = line.replace("```", "")
-        line = line.replace("`", "")
+        if not first_candidate:
+            first_candidate = candidate
 
-        if line.lower().startswith("title:"):
-            line = line[6:].strip()
+        lower = candidate.lower()
+        if any(lower.startswith(t) for t in allowed_types):
+            return candidate
 
-        # Remove accidental surrounding quotes.
-        if len(line) >= 2 and line[0] == line[-1] and line[0] in ('"', "'"):
-            line = line[1:-1].strip()
-
-        lower_line = line.lower()
-        if any(lower_line.startswith(t) for t in allowed_types):
-            return line[:72]
+    # Fallback to first non-empty line if no explicit conventional prefix was found
+    if first_candidate:
+        return first_candidate
 
     raise RuntimeError(
-        "The model generated an invalid commit title.\n\n"
+        "The model generated an empty commit title.\n\n"
         f"Model response:\n{response}"
     )
 
@@ -173,3 +280,65 @@ def clean_description(response):
     joined = re.sub(r'\n{3,}', '\n\n', joined)
     
     return joined
+
+def parse_commit_message(response):
+    """
+    Parse a unified commit message string from the LLM into (title, description).
+    """
+    clean_resp = response.strip()
+    if not clean_resp:
+        raise RuntimeError("The model returned an empty commit message.")
+    if clean_resp.startswith("```"):
+        lines = clean_resp.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        clean_resp = "\n".join(lines).strip()
+
+    try:
+        parsed = json.loads(clean_resp)
+        if isinstance(parsed, dict) and "title" in parsed:
+            return clean_title(parsed["title"]), clean_description(parsed.get("description", ""))
+    except Exception:
+        pass
+
+    allowed_types = (
+        "feat:", "feat(", "fix:", "fix(", "refactor:", "refactor(",
+        "perf:", "perf(", "docs:", "docs(", "test:", "test(",
+        "chore:", "chore(", "build:", "build(", "ci:", "ci("
+    )
+
+    lines = clean_resp.splitlines()
+    title_idx = -1
+    title = ""
+
+    for i, line in enumerate(lines):
+        candidate = clean_title_line(line)
+        if not candidate:
+            continue
+        lower = candidate.lower()
+        if any(lower.startswith(t) for t in allowed_types):
+            title_idx = i
+            title = candidate
+            break
+
+    if title_idx == -1 and lines:
+        for i, line in enumerate(lines):
+            candidate = clean_title_line(line)
+            if candidate:
+                title_idx = i
+                title = candidate
+                break
+
+    desc_lines = lines[title_idx + 1:] if title_idx != -1 else []
+    while desc_lines and not desc_lines[0].strip():
+        desc_lines.pop(0)
+
+    desc_text = "\n".join(desc_lines).strip()
+    try:
+        description = clean_description(desc_text) if desc_text else f"- {title}"
+    except RuntimeError:
+        description = f"- {title}"
+
+    return title, description

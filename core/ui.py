@@ -5,6 +5,7 @@ import subprocess
 import threading
 import itertools
 import time
+import shlex
 from .git_utils import run_git
 
 # ---------------------------------------------------------------------------
@@ -92,11 +93,16 @@ class Spinner:
         for frame in itertools.cycle(self._FRAMES):
             if self._stop.is_set():
                 break
-            print(f"\r{Theme.CYAN}[{frame}] {self.message}{Theme.RESET}",
-                  end="", flush=True)
-            time.sleep(0.1)
-        # Erase the spinner line so the next print starts clean
-        print(f"\r{' ' * (len(self.message) + 6)}\r", end="", flush=True)
+            try:
+                print(f"\r{Theme.CYAN}[{frame}] {self.message}{Theme.RESET}",
+                      end="", flush=True)
+                time.sleep(0.1)
+            except Exception:
+                break
+        try:
+            print(f"\r{' ' * (len(self.message) + 6)}\r", end="", flush=True)
+        except Exception:
+            pass
 
     def __enter__(self):
         self._thread.start()
@@ -129,7 +135,13 @@ def display_staged_files(files: list) -> None:
 
 def display_commit(title, description):
     Theme.print_header("Commit Preview")
-    print(f"{Theme.BOLD}Title:{Theme.RESET}\n{Theme.CYAN}{title}{Theme.RESET}\n")
+    length = len(title)
+    if length <= 72:
+        len_indicator = f"{Theme.DIM}({length} chars){Theme.RESET}"
+    else:
+        len_indicator = f"{Theme.YELLOW}({length} chars - recommended max 72){Theme.RESET}"
+
+    print(f"{Theme.BOLD}Title {len_indicator}:{Theme.RESET}\n{Theme.CYAN}{title}{Theme.RESET}\n")
     print(f"{Theme.BOLD}Description:{Theme.RESET}\n{description}\n")
     print(f"{Theme.DIM}{Icons.SEP}{Theme.RESET}")
 
@@ -142,7 +154,17 @@ def edit_in_editor(title, description):
         f.write(content)
 
     editor = os.environ.get("EDITOR", "notepad" if os.name == "nt" else "nano")
-    subprocess.run([editor, path])
+    cmd = shlex.split(editor, posix=(os.name != "nt")) + [path]
+    try:
+        subprocess.run(cmd)
+    except FileNotFoundError:
+        fallback = "notepad" if os.name == "nt" else "vi"
+        Theme.print_warning(f"Editor '{editor}' not found. Falling back to '{fallback}'...")
+        try:
+            subprocess.run([fallback, path])
+        except Exception as e:
+            Theme.print_error(f"Could not launch editor: {e}")
+            return title, description
 
     with open(path, "r", encoding="utf-8") as f:
         new_content = f.read().strip()

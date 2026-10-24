@@ -1,107 +1,198 @@
-# AI Git Commit Generator
+# Commit
 
-Generate structured, professional [Conventional Commit](https://www.conventionalcommits.org/) messages from your staged changes — powered by a local LLM via [Ollama](https://ollama.com/). No internet required.
+A simple CLI tool that writes Git commit messages for you using a local model through Ollama.
 
-## Requirements
+It inspects your staged changes, generates a Conventional Commit title, and puts together a short summary with bullet points. Everything runs locally on your machine with no API keys, no subscriptions, and your code never leaves your computer.
 
-- Python 3.8+
-- Git
-- [Ollama](https://ollama.com/) running locally
+```
+$ git add .
+$ commit
 
-Pull the default model before first use:
+=== STAGED FILES ===
+  [-] src/auth.py
+  [-] src/routes.py
+
+[/] Generating commit message...
+
+=== COMMIT PREVIEW ===
+Title (48 chars):
+feat(auth): add session-based authentication
+
+Description:
+Replaces basic authentication with token-based sessions across API routes.
+
+- Add session validation middleware for authenticated endpoints.
+- Store session tokens in memory with configurable TTL.
+
+--------------------------------------------------
+  [Y] Commit
+  [P] Commit & Push
+  [E] Edit
+  [R] Regenerate
+  [S] Settings
+  [N] Cancel
+
+Choice:
+```
+
+---
+
+## Prerequisites
+
+- **Git**
+- **Python 3.8+**
+- **[Ollama](https://ollama.com/)** installed and running
+
+You will need a model pulled in Ollama. We recommend `qwen2.5-coder:7b`:
 
 ```bash
 ollama pull qwen2.5-coder:7b
 ```
 
-## Setup
+*(You can also let the tool download a model for you during first-time setup).*
 
-Clone or copy this repo anywhere on your machine. No installation needed — it's just Python.
+---
 
-```
-Commit/
-├── commit.py           ← main script
-├── commit.bat          ← Windows shortcut
-├── commit_history.json ← auto-created after first commit
-└── core/
-    ├── config.py       ← model & settings
-    ├── llm.py          ← Ollama calls & prompts
-    ├── parser.py       ← diff parsing & cleanup
-    ├── git_utils.py    ← git subprocess wrappers
-    ├── ui.py           ← terminal output & editor
-    └── history.py      ← commit history logger
-```
+## Installation
 
-## Usage
-
-### Option 1 — Add to PATH (recommended)
-
-Add the `Commit/` folder to your system `PATH`. Then from any Git repo:
+Clone the repo anywhere you want to keep it:
 
 ```bash
-git add .
-commit
+git clone https://github.com/Bookinheaven/Commit.git
+cd Commit
 ```
 
-### Option 2 — Run directly
+### Linux & macOS
 
+**Option 1: Symlink (recommended)**
 ```bash
-git add src/ app/
-python C:\path\to\Commit\commit.py
+sudo ln -s "$PWD/commit" /usr/local/bin/commit
 ```
 
-### Option 3 — Double-click or call the `.bat`
-
-```bat
-commit.bat
+**Option 2: Add to your PATH**
+Add this to your `~/.bashrc` or `~/.zshrc`:
+```bash
+export PATH="/path/to/Commit:$PATH"
 ```
 
-## What it does on each run
+Once installed, you can just type `commit` inside any git repo.
 
-1. **Checks Ollama** is reachable before doing anything
-2. **Lists your staged files** so you know exactly what's being analyzed
-3. **Generates** a title and description using the LLM (animated spinner while waiting)
-4. **Shows a preview** with an interactive menu
+### Windows
 
-## Interactive Menu
+**Option 1: Add to PATH (recommended)**
+1. Press `Win + S` and search for **"Environment Variables"**.
+2. Under **User variables**, select `Path` and click **Edit**.
+3. Click **New** and paste the folder path where you saved this repo (for example `D:\Tools\Commit`).
+4. Open a new terminal and type `commit`.
 
-| Key | Action |
-|-----|--------|
-| `Y` | Accept and commit |
-| `E` | Open in editor (`$EDITOR`, Notepad, or nano) |
-| `R` | Regenerate a new message |
-| `N` | Cancel without committing |
+**Option 2: Run directly**
+Double-click or run `commit.bat` from your terminal.
+
+---
+
+## How It Works
+
+1. Stage the files you want to commit (or let `commit` prompt to stage modified files for you):
+   ```bash
+   git add .
+   ```
+2. Run `commit`:
+   ```bash
+   commit
+   ```
+3. Look over the preview and pick an action:
+   - **`Y` (Commit)**: Commits the staged changes with the generated message and logs an entry to history.
+   - **`P` (Commit & Push)**: Commits the changes and immediately runs `git push` in one step.
+   - **`E` (Edit)**: Opens the message in your editor (Notepad, nano, VS Code, or whatever `$EDITOR` is set to) so you can make manual adjustments before committing.
+   - **`R` (Regenerate)**: Re-runs generation. You can optionally give it quick instructions (such as *"make it a fix instead of feat"*, *"mention issue #42"*, or *"keep it to two bullets"*), or press Enter to just try again.
+   - **`S` (Settings)**: Opens the settings menu to switch models or tweak memory preferences.
+   - **`N` (Cancel)**: Quits without doing anything to git.
+
+---
+
+## CLI Commands
+
+| Command | Description |
+|---|---|
+| `commit` | Generate commit message for staged changes |
+| `commit -l`, `--history` | View the last 10 commits generated across your repositories |
+| `commit -s`, `--settings` | Open interactive settings (model selection and memory cache) |
+| `commit -h`, `--help` | Show command-line help and options |
+
+---
+
+## Features
+
+- **Single-Pass Speed**: Generates both the title and bullet-point summary in one unified request, cutting wait times in half.
+- **Concise Conventional Commits**: Titles stay under 70 characters with clean module scopes (e.g. `feat(auth): ...`), without listing filenames in parentheses.
+- **Interactive Review**: Commit immediately (`Y`), commit and push (`P`), edit in your favorite editor (`E`), or regenerate with feedback (`R`).
+- **Auto-Staging**: If you forget to run `git add`, `commit` detects modified files and asks if you would like to stage them on the spot.
+- **Recent History**: Keep track of commits generated across projects using `commit -l`.
+- **Repository Rules**: Drop a `.commitrules` file in any repository to enforce custom commit style or ticket prefixes.
+- **Low RAM Friendly**: Choose how long the model stays in memory, including a 0-minute Game Mode that unloads the model immediately after generation.
+
+---
 
 ## Commit History
 
-Every successful commit is appended to `commit_history.json` in the tool's directory:
+View your recent commit history log from anywhere:
 
-```json
-[
-  {
-    "timestamp": "2026-10-16T09:45:00",
-    "repo": "D:/GitHub/MyProject",
-    "title": "feat(auth): add session-based login",
-    "description": "Implements cookie-based sessions...\n\n- Add login/logout endpoints\n- ..."
-  }
-]
+```bash
+commit -l
+# or
+commit --history
 ```
 
-## Configuration
+---
 
-Edit [`core/config.py`](core/config.py):
+## Custom Repository Rules (.commitrules)
 
-```python
-MODEL = "qwen2.5-coder:7b"   # any model available in Ollama
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MAX_DIFF_CHARS = 20000        # diffs larger than this trigger Map-Reduce mode
+If your project or team has specific commit guidelines, you can create a `.commitrules` file in your repository root. The tool will automatically detect it and enforce your rules:
+
+```text
+- Always start the title with a ticket reference if found (e.g. feat(JIRA-101): ...).
+- Keep descriptions strictly to 3 bullet points or fewer.
 ```
 
-## Large Diffs
+---
 
-For large staged changes the tool automatically switches to **Map-Reduce** mode:
+## Settings
 
-1. **Filter** — drops auto-generated files (`package-lock.json`, lockfiles, `.min.js`, etc.)
-2. **Split** — divides the remaining diff into chunks without breaking files apart
-3. **Summarise** — asks the model to bullet-point each chunk (with per-chunk spinner)
-4. **Synthesise** — combines summaries into one coherent commit message
+You can open settings anytime from the menu with `S`, or directly from the terminal:
+
+```bash
+commit --settings
+```
+
+From here you can manage:
+
+### 1. Active Model & One-Click Downloads
+Switch between any models you already have installed, or download one directly inside the tool with a progress bar:
+- **`qwen2.5-coder:7b`** (Recommended: best accuracy for commit conventions)
+- **`qwen2.5-coder:1.5b`** (Lightweight and very fast, great for older laptops)
+- **`llama3.2:3b`** (Solid all-round model)
+- **`deepseek-coder:6.7b`** (Alternative code model)
+- Or enter any model name available on [ollama.com](https://ollama.com).
+
+### 2. Memory & RAM Management
+Local models can take 1 to 5 GB of RAM/VRAM while loaded. You can control how long Ollama keeps the model loaded after you commit:
+- **Low RAM / Game Mode (`0m`)**: Drops the model from memory immediately after the message is generated. Perfect if you have limited RAM or play games while coding.
+- **Standard (`5m`)**: The default Ollama behavior. Keeps the model loaded for 5 minutes of idle time before freeing memory.
+- **Balanced (`15m`)**: Keeps the model ready during active work sessions.
+- **Always Fast (`30m`)**: Keeps the model warm for 30 minutes so subsequent commits generate instantly with zero reload delay.
+
+All settings are saved to `config.json` next to the script.
+
+---
+
+## Large Diffs & Lockfiles
+
+If you stage a big update or run `npm install`, you do not have to worry about lockfile spam:
+- **Noise filtering**: Files like `package-lock.json`, `yarn.lock`, `bun.lockb`, `.min.js`, and `.svg` are automatically trimmed down to their headers. This keeps prompts small and ensures the LLM focuses on your actual code changes.
+- **Map-Reduce mode**: If your real code changes are unusually large, the tool breaks them down by file, summarizes each piece, and combines them into one coherent commit message without hitting model context limits.
+
+---
+
+## License
+
+MIT

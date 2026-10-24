@@ -32,3 +32,29 @@ def _load() -> list:
             return json.load(f)
     except Exception:
         return []
+
+
+def display_history(limit: int = 10) -> None:
+    """Print the most recent commits formatted cleanly for terminal output."""
+    from .ui import Theme
+    entries = _load()
+    if not entries:
+        Theme.print_info("No commit history found yet.")
+        return
+
+    Theme.print_header("Commit History")
+    recent = list(reversed(entries))[:limit]
+    for idx, item in enumerate(recent, 1):
+        ts = item.get("timestamp", "").replace("T", " ")
+        repo_path = item.get("repo", "")
+        repo_name = os.path.basename(os.path.normpath(repo_path)) or repo_path
+        title = item.get("title", "")
+        desc = item.get("description", "")
+
+        print(f"  {Theme.CYAN}[{idx}]{Theme.RESET} {Theme.BOLD}{title}{Theme.RESET}")
+        print(f"      {Theme.DIM}{ts} | Repo: {repo_name}{Theme.RESET}")
+        if desc:
+            first_line = desc.splitlines()[0].strip()
+            print(f"      {Theme.DIM}{first_line[:90]}{Theme.RESET}")
+        print()
+
