@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
+*.pyo
 commit_history.json
 config.json
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
