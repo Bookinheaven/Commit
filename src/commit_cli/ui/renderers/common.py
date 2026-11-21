@@ -310,42 +310,61 @@ def render_generation_diagnostics(
         else:
             c.print("  Chunk plan unavailable.")
 
-        # 5. Model Requests & Tokens
-        c.print("\nMODEL REQUESTS & TOKENS")
-        c.print(f"  Total Requests:         {diagnostics.total_requests}")
-        c.print(f"  Total Latency:          {diagnostics.total_latency_seconds:.2f}s")
-        tot_p = f"{diagnostics.total_prompt_tokens:,}" if diagnostics.total_prompt_tokens is not None else "-"
-        avg_p = f"{diagnostics.avg_prompt_tokens:.1f}" if diagnostics.avg_prompt_tokens is not None else "-"
-        c.print(f"  Prompt Tokens:          total {tot_p} | avg {avg_p}")
-        tot_g = f"{diagnostics.total_generated_tokens:,}" if diagnostics.total_generated_tokens is not None else "-"
-        avg_g = f"{diagnostics.avg_generated_tokens:.1f}" if diagnostics.avg_generated_tokens is not None else "-"
-        c.print(f"  Generated Tokens:       total {tot_g} | avg {avg_g}")
+        # 5. Model Requests & Tokens (Operation Summary)
+        c.print("\nOPERATION TOKEN SUMMARY")
+        c.print(f"  Total Model Requests:     {diagnostics.total_requests}")
+        breakdown_str = ", ".join(f"{stg}: {cnt}" for stg, cnt in diagnostics.requests_by_stage.items()) or "None"
+        c.print(f"  Request Breakdown:        {breakdown_str}")
+        c.print(f"  Total Latency:            {diagnostics.total_latency_seconds:.2f}s")
+        cum_p = f"{diagnostics.cumulative_actual_input_tokens:,} tokens" if diagnostics.cumulative_actual_input_tokens is not None else "N/A"
+        c.print(f"  Cumulative Actual Input:  {cum_p} (provider measured)")
+        cum_g = f"{diagnostics.cumulative_actual_generated_tokens:,} tokens" if diagnostics.cumulative_actual_generated_tokens is not None else "N/A"
+        c.print(f"  Cumulative Actual Gen:    {cum_g} (provider measured)")
+        max_p = f"{diagnostics.max_actual_input_tokens:,} tokens" if diagnostics.max_actual_input_tokens is not None else "N/A"
+        c.print(f"  Max Single Request In:    {max_p}")
+        peak_obs = f"{diagnostics.peak_observed_request_tokens:,} tokens" if diagnostics.peak_observed_request_tokens is not None else "N/A"
+        c.print(f"  Peak Observed Request:    {peak_obs} (max actual input + generated)")
+        max_est = f"{diagnostics.max_estimated_context_requirement:,} tokens" if diagnostics.max_estimated_context_requirement is not None else "N/A"
+        c.print(f"  Max Est Context Required: {max_est} (max input + reserve + margin)")
         rate = (
             f"{diagnostics.avg_tokens_per_second:.1f} tokens/s"
             if diagnostics.avg_tokens_per_second is not None
-            else "-"
+            else "N/A"
         )
-        c.print(f"  Generation Rate:        {rate}")
-        c.print(f"  Ollama Stop Reasons:    {diagnostics.stop_reasons}")
+        c.print(f"  Generation Rate:          {rate}")
 
-        # 6. Map-Reduce Execution
-        c.print("\nMAP-REDUCE SUMMARY")
-        c.print(f"  Map Chunks Processed:   {len(diagnostics.chunk_requests)}")
-        c.print(f"  Reduction Passes:       {len(diagnostics.reduction_passes)}")
-        fits_str = "Yes" if diagnostics.final_synthesis_fits_budget else "No (exceeded)"
-        c.print(f"  Fits Synthesis Budget:  {fits_str}")
-
-        if diagnostics.chunk_requests:
-            c.print("\nPER-CHUNK REQUEST BREAKDOWN")
-            c.print(f"  {'#':<4} {'Type':<12} {'Chars':>8} {'EstTok':>8} {'PromptTok':>10} {'GenTok':>8} {'Latency':>8}")
-            c.print(f"  {'-'*4} {'-'*12} {'-'*8} {'-'*8} {'-'*10} {'-'*8} {'-'*8}")
-            for req in diagnostics.chunk_requests:
-                chars_str = f"{req.char_count:,}" if req.char_count else "-"
-                et = str(req.estimated_tokens) if req.estimated_tokens is not None else "-"
-                pt = str(req.prompt_tokens) if req.prompt_tokens is not None else "-"
-                gt = str(req.generated_tokens) if req.generated_tokens is not None else "-"
-                lat = f"{req.latency_seconds:.2f}s"
-                c.print(f"  {req.chunk_index:<4} {req.chunk_type:<12} {chars_str:>8} {et:>8} {pt:>10} {gt:>8} {lat:>8}")
+        # 6. Per-Request Breakdown
+        if diagnostics.request_metrics:
+            c.print("\nPER-REQUEST CONTEXT BUDGETING & EXECUTION")
+            for idx, req in enumerate(diagnostics.request_metrics, 1):
+                chunk_info = f" (Chunk {req.chunk_index})" if req.chunk_index is not None else ""
+                c.print(f"  Request #{idx} [{req.stage}{chunk_info}]:")
+                c.print("    [Before Inference Estimates]")
+                est_in = f"{req.estimated_input_tokens:,} tokens" if req.estimated_input_tokens is not None else "N/A"
+                c.print(f"      Estimated Input:         {est_in} (heuristic: 3.0 chars/token)")
+                est_ov = f"{req.estimated_prompt_overhead_tokens:,} tokens" if req.estimated_prompt_overhead_tokens is not None else "N/A"
+                c.print(f"      Prompt Overhead:         {est_ov}")
+                res_out = f"{req.reserved_output_tokens:,} tokens" if req.reserved_output_tokens is not None else "N/A"
+                c.print(f"      Reserved Output:         {res_out} (num_predict)")
+                saf_m = f"{req.safety_margin_tokens:,} tokens" if req.safety_margin_tokens is not None else "N/A"
+                c.print(f"      Safety Margin:           {saf_m}")
+                cfg_ctx = f"{req.configured_num_ctx:,} tokens" if req.configured_num_ctx is not None else "N/A"
+                c.print(f"      Configured Context:      {cfg_ctx}")
+                est_req = f"{req.estimated_context_requirement:,} tokens" if req.estimated_context_requirement is not None else "N/A"
+                c.print(f"      Est Context Required:    {est_req}")
+                est_ut = f"{req.estimated_context_utilization * 100:.1f}%" if req.estimated_context_utilization is not None else "N/A"
+                c.print(f"      Est Context Util:        {est_ut}")
+                c.print("    [After Inference Actuals]")
+                act_in = f"{req.actual_input_tokens:,} tokens" if req.actual_input_tokens is not None else "N/A"
+                c.print(f"      Actual Input Tokens:     {act_in} (prompt_eval_count)")
+                act_out = f"{req.actual_generated_tokens:,} tokens" if req.actual_generated_tokens is not None else "N/A"
+                c.print(f"      Actual Generated Tokens: {act_out} (eval_count)")
+                act_in_ut = f"{req.actual_input_utilization * 100:.1f}%" if req.actual_input_utilization is not None else "N/A"
+                c.print(f"      Actual Input Util:       {act_in_ut} (actual input / configured context)")
+                act_req_ut = f"{req.actual_request_utilization * 100:.1f}%" if req.actual_request_utilization is not None else "N/A"
+                c.print(f"      Actual Request Util:     {act_req_ut} ((input + generated) / configured context)")
+                lat_str = f"{req.total_duration_sec:.2f}s" if req.total_duration_sec is not None else "N/A"
+                c.print(f"      Latency:                 {lat_str}")
         c.print("")
         return
 
@@ -446,52 +465,60 @@ def render_generation_diagnostics(
     c.print(t_plan)
 
     # 5. Performance & Metrics
-    t_perf = Table(title="Model Request & Token Metrics", box=box.ROUNDED if style.use_panels else box.SIMPLE, show_header=False)
+    t_perf = Table(title="Operation Token Summary", box=box.ROUNDED if style.use_panels else box.SIMPLE, show_header=False)
     t_perf.add_column("Metric", style="bold", no_wrap=True)
     t_perf.add_column("Value")
-    t_perf.add_row("Total Requests", str(diagnostics.total_requests))
+    t_perf.add_row("Total Model Requests", str(diagnostics.total_requests))
+    breakdown_str = ", ".join(f"{stg}: {cnt}" for stg, cnt in diagnostics.requests_by_stage.items()) or "None"
+    t_perf.add_row("Request Breakdown", breakdown_str)
     t_perf.add_row("Total Latency", f"{diagnostics.total_latency_seconds:.2f}s")
-    tot_p = f"{diagnostics.total_prompt_tokens:,}" if diagnostics.total_prompt_tokens is not None else "-"
-    avg_p = f"{diagnostics.avg_prompt_tokens:.1f}" if diagnostics.avg_prompt_tokens is not None else "-"
-    t_perf.add_row("Prompt Tokens", f"total {tot_p} | avg {avg_p}")
-    tot_g = f"{diagnostics.total_generated_tokens:,}" if diagnostics.total_generated_tokens is not None else "-"
-    avg_g = f"{diagnostics.avg_generated_tokens:.1f}" if diagnostics.avg_generated_tokens is not None else "-"
-    t_perf.add_row("Generated Tokens", f"total {tot_g} | avg {avg_g}")
+    cum_p = f"{diagnostics.cumulative_actual_input_tokens:,} tokens" if diagnostics.cumulative_actual_input_tokens is not None else "N/A"
+    t_perf.add_row("Cumulative Actual Input", cum_p)
+    cum_g = f"{diagnostics.cumulative_actual_generated_tokens:,} tokens" if diagnostics.cumulative_actual_generated_tokens is not None else "N/A"
+    t_perf.add_row("Cumulative Actual Generated", cum_g)
+    max_p = f"{diagnostics.max_actual_input_tokens:,} tokens" if diagnostics.max_actual_input_tokens is not None else "N/A"
+    t_perf.add_row("Max Single-Request Input", max_p)
+    peak_obs = f"{diagnostics.peak_observed_request_tokens:,} tokens" if diagnostics.peak_observed_request_tokens is not None else "N/A"
+    t_perf.add_row("Peak Observed Request", peak_obs)
+    max_est = f"{diagnostics.max_estimated_context_requirement:,} tokens" if diagnostics.max_estimated_context_requirement is not None else "N/A"
+    t_perf.add_row("Max Est Context Required", max_est)
     rate = (
         f"{diagnostics.avg_tokens_per_second:.1f} tokens/s"
         if diagnostics.avg_tokens_per_second is not None
-        else "-"
+        else "N/A"
     )
     t_perf.add_row("Generation Rate", rate)
-    t_perf.add_row("Ollama Stop Reasons", str(diagnostics.stop_reasons))
     c.print(t_perf)
 
-    # 6. Per-Chunk Breakdown
-    if diagnostics.chunk_requests:
+    # 6. Per-Request Context Budgeting & Actuals
+    if diagnostics.request_metrics:
         fits_note = "[green]Yes[/green]" if diagnostics.final_synthesis_fits_budget else "[bold red]No[/bold red]"
-        t_chunks = Table(
-            title=f"Per-Chunk Request Breakdown [dim](Passes: {len(diagnostics.reduction_passes)} | Fits Synthesis Budget: {fits_note})[/dim]",
+        t_reqs = Table(
+            title=f"Per-Request Context Budgeting & Execution [dim](Fits Synthesis Budget: {fits_note})[/dim]",
             box=box.ROUNDED if style.use_panels else box.SIMPLE,
         )
-        t_chunks.add_column("#", justify="right", style="bold")
-        t_chunks.add_column("Type", style="cyan")
-        t_chunks.add_column("Files", justify="right")
-        t_chunks.add_column("Chars", justify="right")
-        t_chunks.add_column("Lines", justify="right")
-        t_chunks.add_column("Est. Tokens", justify="right")
-        t_chunks.add_column("Prompt Tokens", justify="right")
-        t_chunks.add_column("Gen. Tokens", justify="right")
-        t_chunks.add_column("Latency", justify="right", style="green")
+        t_reqs.add_column("#", justify="right", style="bold")
+        t_reqs.add_column("Stage", style="cyan")
+        t_reqs.add_column("Est. In", justify="right")
+        t_reqs.add_column("Overhead", justify="right")
+        t_reqs.add_column("Resv. Out", justify="right")
+        t_reqs.add_column("Est. Util", justify="right")
+        t_reqs.add_column("Actual In", justify="right")
+        t_reqs.add_column("Actual Gen", justify="right")
+        t_reqs.add_column("Actual Util", justify="right")
+        t_reqs.add_column("Latency", justify="right", style="green")
 
-        for req in diagnostics.chunk_requests:
-            fc = str(req.file_count) if req.file_count else "-"
-            cc = f"{req.char_count:,}" if req.char_count else "-"
-            lc = f"{req.line_count:,}" if req.line_count else "-"
-            et = f"{req.estimated_tokens:,}" if req.estimated_tokens is not None else "-"
-            pt = f"{req.prompt_tokens:,}" if req.prompt_tokens is not None else "-"
-            gt = f"{req.generated_tokens:,}" if req.generated_tokens is not None else "-"
-            lat = f"{req.latency_seconds:.2f}s"
-            t_chunks.add_row(str(req.chunk_index), req.chunk_type, fc, cc, lc, et, pt, gt, lat)
+        for idx, req in enumerate(diagnostics.request_metrics, 1):
+            lbl = f"#{req.chunk_index}" if req.chunk_index is not None else str(idx)
+            ei = f"{req.estimated_input_tokens:,}" if req.estimated_input_tokens is not None else "N/A"
+            eo = f"{req.estimated_prompt_overhead_tokens:,}" if req.estimated_prompt_overhead_tokens is not None else "N/A"
+            ro = f"{req.reserved_output_tokens:,}" if req.reserved_output_tokens is not None else "N/A"
+            eu = f"{req.estimated_context_utilization * 100:.1f}%" if req.estimated_context_utilization is not None else "N/A"
+            ai = f"{req.actual_input_tokens:,}" if req.actual_input_tokens is not None else "N/A"
+            ag = f"{req.actual_generated_tokens:,}" if req.actual_generated_tokens is not None else "N/A"
+            au = f"{req.actual_input_utilization * 100:.1f}%" if req.actual_input_utilization is not None else "N/A"
+            lat = f"{req.total_duration_sec:.2f}s" if req.total_duration_sec is not None else "N/A"
+            t_reqs.add_row(lbl, req.stage, ei, eo, ro, eu, ai, ag, au, lat)
 
-        c.print(t_chunks)
+        c.print(t_reqs)
     c.print("")

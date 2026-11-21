@@ -24,8 +24,12 @@ Commit inspects your staged Git changes, understands your project structure and 
   - Analyzes only staged changes (`git diff --cached`).
   - Preserves standard Git hooks (`pre-commit`, `commit-msg`) and GPG/SSH signing.
   - Never stages, pushes, or executes destructive Git commands.
-- **Large-Diff Handling**:
-  - Smart chunking and token budgeting for repositories with large or multi-file diffs.
+- **Large-Diff & Status-Aware Handling**:
+  - **Status-Aware Diff Analysis**: Separates added/modified files from deleted files. Deleted files contribute metadata and a compact deletion manifest instead of sending vanished source code into the LLM context, dramatically cutting chunk counts.
+  - **Complete-Prompt Context Budgeting**: Pre-flight checks calculate full request token requirements (system prompt, user instructions, diff content, commit rules, and output reservations) against the resolved model context window.
+  - **Hierarchical Chunking & Reduction**: Multi-file diffs that exceed the model context are automatically split along file and hunk boundaries, analyzed in parallel or sequential passes, and consolidated through hierarchical reduction passes.
+- **Deep Generation Diagnostics**:
+  - `--debug-generation` outputs comprehensive token accounting, context utilization, chunk planning, and per-request latency/throughput metrics.
 - **Pipeline & Non-Interactive Ready**:
   - `--stdout` pipes generated commit messages directly to stdout for shell scripts.
   - `--dry-run` previews messages without writing to Git.
@@ -340,6 +344,19 @@ commit config unset model
 | `timeout` | `COMMIT_TIMEOUT` | `120.0` | Overall generation deadline in seconds |
 | `connect_timeout` | `COMMIT_CONNECT_TIMEOUT` | `5.0` | HTTP connect timeout in seconds |
 | `read_timeout` | `COMMIT_READ_TIMEOUT` | `60.0` | HTTP read inactivity timeout in seconds |
+| — | `COMMIT_NUM_CTX` | `None` | Primary context window override in tokens (bypasses default 8,192 cap) |
+| — | `OLLAMA_NUM_CTX` | `None` | Secondary context window override in tokens (bypasses default 8,192 cap) |
+
+### Context Window Resolution Precedence
+
+Commit determines the effective context window used for prompt budgeting and LLM requests according to the following precedence:
+
+1. **Explicit User Environment**: `COMMIT_NUM_CTX` (highest precedence), followed by `OLLAMA_NUM_CTX`. When specified, these bypass the default safety cap.
+2. **Modelfile Configuration**: Any explicit `PARAMETER num_ctx <int>` configured in the model's Ollama Modelfile.
+3. **Model GGUF Metadata (Default Capped)**: The advertised architectural context length from GGUF metadata, safely capped at **8,192 tokens** by default to prevent excessive VRAM allocations and read timeouts on consumer hardware.
+4. **Safe Default Fallback**: Defaults to **8,192 tokens** if model discovery fails or the server endpoint cannot be queried.
+
+The exact resolved context capacity is passed to Ollama in every API request under `options.num_ctx`, ensuring that pre-flight validation, chunk sizing, hierarchical reduction, and runtime inference always share a single source of truth.
 
 ---
 
@@ -386,7 +403,9 @@ Commit is engineered to preserve the integrity of your Git repository:
 
 ---
 
-## Diagnostics (`commit doctor`)
+## Diagnostics
+
+### System Health (`commit doctor`)
 
 If you encounter any issues with Git, Python, or Ollama connectivity, run:
 
@@ -400,6 +419,22 @@ commit doctor
 - Staged changes, unstaged changes, and untracked files count.
 - Configuration and history file paths.
 - Active model, provider, appearance, and Ollama endpoint connectivity.
+
+### Generation Diagnostics (`--debug-generation`)
+
+To inspect context budgeting, token accounting, chunk plans, and latency metrics in real time:
+
+```bash
+commit --dry-run --debug-generation
+```
+
+Generation diagnostics displays:
+- **Model & Runtime**: Server version, architecture, quantization, advertised context length, and loaded runtime `num_ctx`.
+- **Staged Diff Breakdown**: Status-aware metrics separating eligible added/modified files from deleted files and deletion manifest volume.
+- **Context Budget Plan**: Safety margin, output reservation (`num_predict`), estimated overhead, and available diff budget.
+- **Diff Chunking Plan**: Total chunk count, chunk character distribution, and splitting boundary reasons.
+- **Operation Token Summary**: Total model requests, stage breakdown, cumulative provider-measured input and generated tokens, peak observed request tokens, and tokens per second.
+- **Per-Request Breakdown**: Pre-inference estimates vs. post-inference provider actuals (`prompt_eval_count`, `eval_count`, duration, and context utilization).
 
 ---
 

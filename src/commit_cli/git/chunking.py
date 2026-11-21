@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from commit_cli.exceptions import CommitParseError, CommitValidationError
-from commit_cli.models import StagedDiff
+from commit_cli.models import GenerationRequest, StagedDiff
 
 # Conservative token estimation:
 # In source code and diffs containing syntax, punctuation, indentation, and CamelCase identifiers,
@@ -35,31 +35,135 @@ FIXED_PROMPT_OVERHEAD_TOKENS = 1600
 SAFETY_MARGIN_FRACTION = 0.20
 
 
-def compute_diff_token_budget(context_window: int | None) -> int:
-    """Calculate the safe token budget available for staged diff content.
+@dataclass(frozen=True)
+class RequestBudgetCheck:
+    """Pre-flight context budget evaluation for an LLM request."""
 
-    Deducts safety margins, instruction prompts, schema overhead, and response tokens.
-    Dynamically scales overhead and safety margins to support small, normal, and large context windows
-    without ever forcing a diff budget that exceeds total available context.
+    is_valid: bool
+    estimated_input_tokens: int
+    estimated_prompt_overhead_tokens: int
+    reserved_output_tokens: int
+    safety_margin_tokens: int
+    total_required_tokens: int
+    context_capacity: int
+    available_input_tokens: int
+    estimated_context_utilization: float
+    deficit_tokens: int = 0
+
+    @property
+    def estimated_context_requirement(self) -> int:
+        return self.total_required_tokens
+
+
+def estimate_text_tokens(text: str | None) -> int:
+    """Estimate token count for a text string using the 3.0 chars/token heuristic."""
+    if not text:
+        return 0
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+def estimate_request_input_tokens(request: GenerationRequest) -> int:
+    """Estimate total input tokens for the complete serialized request.
+
+    Counts actual system and user messages produced by the request builder.
+    Does NOT include response_schema JSON schema since Ollama passes schema
+    via the API 'format' parameter rather than as prompt text.
+    """
+    sys_chars = len(request.system_prompt) if request.system_prompt else 0
+    prompt_chars = len(request.prompt) if request.prompt else 0
+    return math.ceil((sys_chars + prompt_chars) / CHARS_PER_TOKEN)
+
+
+def validate_request_budget(
+    request: GenerationRequest,
+    context_window: int | None = None,
+    safety_margin_fraction: float = 0.15,
+    content_text: str | None = None,
+) -> RequestBudgetCheck:
+    """Evaluate whether an LLM request fits safely within the model's context budget.
+
+    Context constraint:
+        available_input = effective_ctx - num_predict - safety_margin
+        total_required  = estimated_input + num_predict + safety_margin
     """
     ctx = context_window or DEFAULT_FALLBACK_CONTEXT_WINDOW
-    # Cap maximum context window to 32,768 tokens to prevent local VRAM/OOM exhaustion
     effective_ctx = min(ctx, 32768)
 
-    # Scale reserved overhead for instructions, schema, and response tokens (350 - 800 tokens)
-    reserved_overhead = max(350, min(800, int(effective_ctx * 0.25)))
-    safety_margin = max(100, int(effective_ctx * 0.15))
+    reserved_output = request.max_tokens if request.max_tokens is not None else 600
+    safety_margin = max(50, int(effective_ctx * safety_margin_fraction))
+    available_input = max(0, effective_ctx - reserved_output - safety_margin)
 
-    available = effective_ctx - safety_margin - reserved_overhead
-    # Never force a minimum diff-token budget that exceeds available context!
-    min_budget = max(100, min(available, int(effective_ctx * 0.20)))
-    return max(min_budget, available)
+    estimated_input = estimate_request_input_tokens(request)
+    total_required = estimated_input + reserved_output + safety_margin
+    is_valid = total_required <= effective_ctx
+    deficit = max(0, total_required - effective_ctx)
+
+    if content_text:
+        content_tokens = estimate_text_tokens(content_text)
+        overhead_tokens = max(0, estimated_input - content_tokens)
+    else:
+        sys_tokens = estimate_text_tokens(request.system_prompt)
+        overhead_tokens = sys_tokens + 150
+
+    utilization = round(estimated_input / effective_ctx, 4) if effective_ctx > 0 else 1.0
+
+    return RequestBudgetCheck(
+        is_valid=is_valid,
+        estimated_input_tokens=estimated_input,
+        estimated_prompt_overhead_tokens=overhead_tokens,
+        reserved_output_tokens=reserved_output,
+        safety_margin_tokens=safety_margin,
+        total_required_tokens=total_required,
+        context_capacity=effective_ctx,
+        available_input_tokens=available_input,
+        estimated_context_utilization=utilization,
+        deficit_tokens=deficit,
+    )
 
 
-def compute_diff_char_budget(context_window: int | None) -> int:
-    """Calculate the safe character budget for a single model request diff payload."""
-    token_budget = compute_diff_token_budget(context_window)
-    practical_budget = min(token_budget, MAX_CHUNK_DIFF_TOKENS)
+def compute_diff_token_budget(
+    context_window: int | None,
+    reserved_output_tokens: int = 2048,
+    prompt_overhead_tokens: int = 400,
+    safety_margin_fraction: float = 0.15,
+) -> int:
+    """Calculate the safe token budget available for staged diff content.
+
+    Deducts safety margins, instruction prompts, and output reservations.
+    Returns 0 if available capacity is zero or negative (infeasible budget).
+    Never manufactures artificial capacity with a fixed minimum.
+    """
+    ctx = context_window or DEFAULT_FALLBACK_CONTEXT_WINDOW
+    effective_ctx = min(ctx, 32768)
+
+    output_res = min(reserved_output_tokens, max(100, int(effective_ctx * 0.35)))
+    safety_margin = max(50, int(effective_ctx * safety_margin_fraction))
+    overhead = min(prompt_overhead_tokens, max(100, int(effective_ctx * 0.10)))
+
+    available = effective_ctx - safety_margin - output_res - overhead
+    if available <= 0:
+        return 0
+    return available
+
+
+def compute_diff_char_budget(
+    context_window: int | None,
+    reserved_output_tokens: int = 2048,
+    prompt_overhead_tokens: int = 400,
+    max_tokens: int | None = MAX_CHUNK_DIFF_TOKENS,
+) -> int:
+    """Calculate the safe character budget for a single model request diff payload.
+
+    Returns 0 if available token budget is zero or negative.
+    """
+    token_budget = compute_diff_token_budget(
+        context_window,
+        reserved_output_tokens=reserved_output_tokens,
+        prompt_overhead_tokens=prompt_overhead_tokens,
+    )
+    if token_budget <= 0:
+        return 0
+    practical_budget = min(token_budget, max_tokens) if max_tokens is not None else token_budget
     return int(practical_budget * CHARS_PER_TOKEN)
 
 
@@ -341,12 +445,15 @@ class _ParsedFile:
     file_path: str
     is_binary: bool
     hunks: list[_ParsedHunk]
+    is_deleted: bool = False
 
 
 def _extract_file_path(header: str) -> str:
     """Extract destination file path from unified diff header."""
     for line in header.splitlines():
         if line.startswith("+++ b/"):
+            return line[6:].strip()
+        if line.startswith("--- a/") and "+++ /dev/null" in header:
             return line[6:].strip()
         if line.startswith("diff --git a/"):
             parts = line.split(" b/", 1)
@@ -355,14 +462,20 @@ def _extract_file_path(header: str) -> str:
     return "unknown_file"
 
 
-def _parse_unified_diff(lines_iter: Any) -> list[_ParsedFile]:
-    """Parse raw unified diff lines into file and hunk hierarchies."""
+def _parse_unified_diff(lines_iter: Any, deleted_paths: set[str] | None = None) -> list[_ParsedFile]:
+    """Parse raw unified diff lines into file and hunk hierarchies.
+
+    Identifies fully deleted files and skips accumulating their content lines
+    to preserve memory and chunking budget.
+    """
     files: list[_ParsedFile] = []
     current_header_lines: list[str] = []
     current_hunks: list[_ParsedHunk] = []
     current_hunk_header: str | None = None
     current_hunk_lines: list[str] = []
     is_binary = False
+    is_deleted = False
+    skip_deleted_content = False
 
     def flush_hunk() -> None:
         nonlocal current_hunk_header, current_hunk_lines
@@ -372,28 +485,45 @@ def _parse_unified_diff(lines_iter: Any) -> list[_ParsedFile]:
             current_hunk_lines = []
 
     def flush_file() -> None:
-        nonlocal current_header_lines, current_hunks, is_binary
+        nonlocal current_header_lines, current_hunks, is_binary, is_deleted, skip_deleted_content
         flush_hunk()
         if current_header_lines:
             header_str = "".join(current_header_lines)
             path = _extract_file_path(header_str)
+            if deleted_paths and path in deleted_paths:
+                is_deleted = True
             files.append(
                 _ParsedFile(
                     header=header_str,
                     file_path=path,
                     is_binary=is_binary,
-                    hunks=current_hunks,
+                    hunks=current_hunks if not is_deleted else [],
+                    is_deleted=is_deleted,
                 )
             )
             current_header_lines = []
             current_hunks = []
             is_binary = False
+            is_deleted = False
+            skip_deleted_content = False
 
     for line in lines_iter:
         if line.startswith("diff --git "):
             flush_file()
             current_header_lines.append(line)
+        elif skip_deleted_content:
+            continue
         elif line.startswith("@@ "):
+            header_preview = "".join(current_header_lines)
+            path_preview = _extract_file_path(header_preview)
+            if (
+                "deleted file mode " in header_preview
+                or "+++ /dev/null" in header_preview
+                or (deleted_paths and path_preview in deleted_paths)
+            ):
+                is_deleted = True
+                skip_deleted_content = True
+                continue
             flush_hunk()
             current_hunk_header = line
         elif current_hunk_header is not None:
@@ -401,6 +531,8 @@ def _parse_unified_diff(lines_iter: Any) -> list[_ParsedFile]:
         else:
             if "Binary files " in line or "GIT binary patch" in line:
                 is_binary = True
+            if "deleted file mode " in line or "+++ /dev/null" in line:
+                is_deleted = True
             current_header_lines.append(line)
 
     flush_file()
@@ -451,18 +583,33 @@ def create_diff_chunks(
     4. Split oversized lines into numbered continuation fragments without character loss.
     5. Retain file headers across all split chunks.
     """
+    if max_chunk_chars <= 0:
+        from commit_cli.exceptions import CommitCLIError
+        raise CommitCLIError(
+            "Available diff budget is zero or negative: context window is too small "
+            "to fit safety margins, prompt overhead, and output reservations."
+        )
+
     if split_reasons is not None:
         split_reasons.setdefault("file_boundary", 0)
         split_reasons.setdefault("hunk_boundary", 0)
         split_reasons.setdefault("line_boundary", 0)
         split_reasons.setdefault("oversized_line", 0)
 
-    parsed_files = _parse_unified_diff(diff.iter_lines())
+    from commit_cli.models import FileStatus
 
-    if not parsed_files:
-        # If no diff content was found (e.g. empty commit or binary-only with no hunks)
-        file_paths = [f.path for f in diff.files]
-        summary_content = "\n".join(f"- {f.path} [{f.status.value}]" for f in diff.files) or "(No diff content)"
+    deleted_paths = {f.path for f in diff.files if f.status == FileStatus.DELETED}
+    parsed_files = _parse_unified_diff(diff.iter_lines(), deleted_paths=deleted_paths)
+    eligible_parsed_files = [f for f in parsed_files if not f.is_deleted]
+
+    if not eligible_parsed_files:
+        all_deleted = bool(diff.files and all(f.status == FileStatus.DELETED for f in diff.files))
+        if all_deleted:
+            return []
+        file_paths = [f.path for f in diff.files if f.status != FileStatus.DELETED]
+        if not file_paths:
+            return []
+        summary_content = "\n".join(f"- {f.path} [{f.status.value}]" for f in diff.files if f.status != FileStatus.DELETED) or "(No diff content)"
         return [DiffChunk(chunk_index=1, total_chunks=1, content=summary_content, files=file_paths)]
 
     raw_chunks: list[tuple[str, list[str]]] = []
@@ -478,7 +625,7 @@ def create_diff_chunks(
             current_files = []
             current_size = 0
 
-    for file_obj in parsed_files:
+    for file_obj in eligible_parsed_files:
         # Calculate full file diff size
         file_hunk_lines = [h.header + "".join(h.lines) for h in file_obj.hunks]
         file_total_str = file_obj.header + "".join(file_hunk_lines)

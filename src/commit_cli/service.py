@@ -23,13 +23,18 @@ from commit_cli.exceptions import (
 from commit_cli.git.chunking import (
     CHARS_PER_TOKEN,
     CHUNK_ANALYSIS_JSON_SCHEMA,
+    DEFAULT_FALLBACK_CONTEXT_WINDOW,
     ChunkSummary,
     DiffChunk,
     FileSummary,
+    RequestBudgetCheck,
     compute_diff_char_budget,
     create_diff_chunks,
+    estimate_request_input_tokens,
     parse_chunk_summary,
+    validate_request_budget,
 )
+from commit_cli.git.diff import analyze_status_aware_diff, format_deletion_manifest
 from commit_cli.models import CommitMessage, GenerationRequest, StagedDiff, StreamChunk
 from commit_cli.parser.commit import parse_commit_response
 from commit_cli.prompt.engine import (
@@ -64,19 +69,33 @@ class GenerationService:
         """Discard cached chunk summaries (e.g. when staged snapshot is refreshed)."""
         self._cached_summaries = None
 
+    def _get_context_window(self) -> int:
+        """Fetch provider model context window or return safe fallback."""
+        try:
+            ctx = self._provider.get_context_window()
+            if isinstance(ctx, int) and ctx > 0:
+                return ctx
+        except Exception:
+            pass
+        return DEFAULT_FALLBACK_CONTEXT_WINDOW
+
     def _record_metric(
         self,
         stage: str,
         resp: Any,
+        request: GenerationRequest | None = None,
+        check: RequestBudgetCheck | None = None,
         chunk_index: int | None = None,
         file_count: int | None = None,
         char_count: int | None = None,
-        estimated_tokens: int | None = None,
         retries: int = 0,
     ) -> None:
         """Record model request metrics into diagnostics if enabled."""
         if self.diagnostics is None or resp is None:
             return
+
+        if check is None and request is not None:
+            check = validate_request_budget(request, context_window=self._get_context_window())
 
         prompt_tokens = getattr(resp, "prompt_tokens", None) or getattr(resp, "prompt_eval_count", None)
         if not isinstance(prompt_tokens, (int, float)):
@@ -89,6 +108,14 @@ class GenerationService:
             generated_tokens = None
         else:
             generated_tokens = int(generated_tokens)
+
+        cfg_ctx = check.context_capacity if check else None
+        actual_input_util = round(prompt_tokens / cfg_ctx, 4) if (prompt_tokens and cfg_ctx) else None
+        actual_req_util = (
+            round((prompt_tokens + generated_tokens) / cfg_ctx, 4)
+            if (prompt_tokens is not None and generated_tokens is not None and cfg_ctx)
+            else None
+        )
 
         total_sec = getattr(resp, "duration_seconds", None)
         total_ns = getattr(resp, "total_duration_ns", None)
@@ -116,9 +143,17 @@ class GenerationService:
                 chunk_index=chunk_index,
                 file_count=file_count,
                 char_count=char_count,
-                estimated_tokens=estimated_tokens,
-                prompt_tokens=prompt_tokens,
-                generated_tokens=generated_tokens,
+                estimated_input_tokens=check.estimated_input_tokens if check else None,
+                estimated_prompt_overhead_tokens=check.estimated_prompt_overhead_tokens if check else None,
+                reserved_output_tokens=check.reserved_output_tokens if check else None,
+                safety_margin_tokens=check.safety_margin_tokens if check else None,
+                configured_num_ctx=cfg_ctx,
+                estimated_context_requirement=check.estimated_context_requirement if check else None,
+                estimated_context_utilization=check.estimated_context_utilization if check else None,
+                actual_input_tokens=prompt_tokens,
+                actual_generated_tokens=generated_tokens,
+                actual_input_utilization=actual_input_util,
+                actual_request_utilization=actual_req_util,
                 total_duration_sec=total_sec,
                 load_duration_sec=load_sec,
                 prompt_eval_duration_sec=pe_sec,
@@ -155,15 +190,28 @@ class GenerationService:
         self.diagnostics.diff = build_diff_diagnostics(diff, chunks, budget)
         self.diagnostics.chunk_plan = build_chunk_plan_diagnostics(chunks, split_reasons)
 
+    def _get_single_request_char_budget(self) -> int:
+        """Compute the model-aware character budget for a single-request generation prompt (600 reserved output tokens)."""
+        ctx_window = self._get_context_window()
+        return compute_diff_char_budget(
+            ctx_window,
+            reserved_output_tokens=600,
+            prompt_overhead_tokens=600,
+            max_tokens=None,
+        )
+
+    def _get_chunk_char_budget(self) -> int:
+        """Compute the model-aware character budget for a chunk analysis prompt (2048 reserved output tokens)."""
+        ctx_window = self._get_context_window()
+        return compute_diff_char_budget(
+            ctx_window,
+            reserved_output_tokens=2048,
+            prompt_overhead_tokens=400,
+        )
+
     def _get_char_budget(self) -> int:
-        """Compute the model-aware character budget for a single diff prompt."""
-        try:
-            ctx_window = self._provider.get_context_window()
-        except Exception:
-            ctx_window = None
-        if not isinstance(ctx_window, int):
-            ctx_window = None
-        return compute_diff_char_budget(ctx_window)
+        """Compute the model-aware character budget for diff chunking (alias for chunk budget)."""
+        return self._get_chunk_char_budget()
 
     def _analyze_chunk_with_retry(
         self,
@@ -176,16 +224,45 @@ class GenerationService:
             custom_rules=self._custom_rules,
             max_tokens=2048,
         )
-        est_tokens = math.ceil(len(chunk.content) / CHARS_PER_TOKEN)
+        ctx_win = self._get_context_window()
+        check = validate_request_budget(req, context_window=ctx_win, content_text=chunk.content)
+
+        if not check.is_valid:
+            can_fit_content = check.available_input_tokens > check.estimated_prompt_overhead_tokens
+            if can_fit_content and retry_depth < 2 and len(chunk.content) > 100:
+                # Sub-chunk because request exceeds budget
+                half_budget = max(50, len(chunk.content) // 2)
+                sub_diff = StagedDiff(raw_diff=chunk.content, original_char_count=len(chunk.content))
+                sub_chunks = create_diff_chunks(sub_diff, max_chunk_chars=half_budget)
+                if len(sub_chunks) > 1:
+                    sub_summaries: list[ChunkSummary] = []
+                    for sub in sub_chunks:
+                        sub_summaries.extend(self._analyze_chunk_with_retry(sub, retry_depth=retry_depth + 1))
+                    return sub_summaries
+            elif not can_fit_content:
+                # Fixed prompt overhead alone exceeds available input capacity.
+                # Downstream sub-chunking cannot fix this. Fall back to metadata summary or raise.
+                if chunk.files:
+                    return [
+                        ChunkSummary(
+                            files=[FileSummary(path=f, change_type="modified") for f in chunk.files],
+                            functional_changes=[f"Update {Path(f).name}" for f in chunk.files],
+                        )
+                    ]
+                raise CommitCLIError(
+                    f"Prompt overhead ({check.estimated_prompt_overhead_tokens} tokens) exceeds available context capacity ({check.available_input_tokens} tokens)."
+                )
+
         try:
             response = self._provider.generate(req)
             self._record_metric(
                 stage="retry" if retry_depth > 0 else "chunk_analysis",
                 resp=response,
+                request=req,
+                check=check,
                 chunk_index=chunk.chunk_index,
                 file_count=len(chunk.files),
                 char_count=len(chunk.content),
-                estimated_tokens=est_tokens,
                 retries=retry_depth,
             )
             summary = parse_chunk_summary(response.text)
@@ -200,12 +277,15 @@ class GenerationService:
                 # Bounded retry: split chunk in half and analyze sub-chunks
                 half_budget = max(50, len(chunk.content) // 2)
                 sub_diff = StagedDiff(raw_diff=chunk.content, original_char_count=len(chunk.content))
-                sub_chunks = create_diff_chunks(sub_diff, max_chunk_chars=half_budget)
-                if len(sub_chunks) > 1:
-                    sub_summaries: list[ChunkSummary] = []
-                    for sub in sub_chunks:
-                        sub_summaries.extend(self._analyze_chunk_with_retry(sub, retry_depth=retry_depth + 1))
-                    return sub_summaries
+                try:
+                    sub_chunks = create_diff_chunks(sub_diff, max_chunk_chars=half_budget)
+                    if len(sub_chunks) > 1:
+                        sub_summaries = []
+                        for sub in sub_chunks:
+                            sub_summaries.extend(self._analyze_chunk_with_retry(sub, retry_depth=retry_depth + 1))
+                        return sub_summaries
+                except CommitCLIError:
+                    pass
 
             # If sub-chunking cannot proceed on parse failure or timeout, build a fallback summary from chunk file metadata
             if (is_parse_failure or is_timeout) and chunk.files:
@@ -318,12 +398,16 @@ class GenerationService:
             temperature=0.1,
             max_tokens=600,
         )
+        check = validate_request_budget(red_req, context_window=self._get_context_window())
+        if not check.is_valid:
+            return det_summary
+
         if on_progress:
             on_progress(batch_index, total_batches, "reducing")
 
         try:
             resp = self._provider.generate(red_req)
-            self._record_metric(stage="reduction", resp=resp)
+            self._record_metric(stage="reduction", resp=resp, request=red_req, check=check)
             parsed = parse_chunk_summary(resp.text)
             combined_breaking = list(dict.fromkeys(det_summary.breaking_changes + parsed.breaking_changes))
             all_file_paths = {f.path for f in det_summary.files}
@@ -407,6 +491,66 @@ class GenerationService:
 
         return current
 
+    def _prepare_synthesis_request(
+        self,
+        summaries: list[ChunkSummary],
+        status_aware: Any,
+        user_feedback: str | None = None,
+        temperature: float = 0.1,
+    ) -> tuple[GenerationRequest, RequestBudgetCheck]:
+        """Build and validate final synthesis request, applying budget compaction if needed."""
+        ctx_win = self._get_context_window()
+        manifest = status_aware.deletion_manifest
+
+        synth_req = build_synthesis_request(
+            summaries=summaries,
+            custom_rules=self._custom_rules,
+            recent_commits=self._recent_commits,
+            user_feedback=user_feedback,
+            temperature=temperature,
+            deletion_manifest=manifest,
+        )
+        check = validate_request_budget(synth_req, context_window=ctx_win)
+
+        # 1. If oversized and deletion manifest present, compact deletion manifest
+        if not check.is_valid and status_aware.deleted_files:
+            overhead = len(synth_req.prompt) - len(manifest)
+            avail_chars = max(300, int(check.available_input_tokens * CHARS_PER_TOKEN) - overhead - 200)
+            compact_manifest = format_deletion_manifest(status_aware.deleted_files, max_chars=avail_chars)
+            synth_req = build_synthesis_request(
+                summaries=summaries,
+                custom_rules=self._custom_rules,
+                recent_commits=self._recent_commits,
+                user_feedback=user_feedback,
+                temperature=temperature,
+                deletion_manifest=compact_manifest,
+            )
+            check = validate_request_budget(synth_req, context_window=ctx_win)
+
+        # 2. If still oversized, compact summaries
+        if not check.is_valid and summaries:
+            pruned = [
+                ChunkSummary(
+                    files=s.files,
+                    functional_changes=s.functional_changes,
+                    api_changes=s.api_changes,
+                    breaking_changes=s.breaking_changes,
+                )
+                for s in summaries
+            ]
+            merged = self._deterministic_merge_batch(pruned)
+            synth_req = build_synthesis_request(
+                summaries=[merged],
+                custom_rules=self._custom_rules,
+                recent_commits=self._recent_commits,
+                user_feedback=user_feedback,
+                temperature=temperature,
+                deletion_manifest=status_aware.deletion_manifest,
+            )
+            check = validate_request_budget(synth_req, context_window=ctx_win)
+
+        return synth_req, check
+
     def generate_commit(
         self,
         diff: StagedDiff,
@@ -418,47 +562,92 @@ class GenerationService:
         if not diff.files and diff.original_char_count == 0:
             raise CommitCLIError("Cannot generate commit message: no staged changes provided.")
 
-        budget = self._get_char_budget()
+        ctx_win = self._get_context_window()
+        single_req_budget = self._get_single_request_char_budget()
+        chunk_budget = self._get_chunk_char_budget()
+        status_aware = analyze_status_aware_diff(diff)
 
-        # Fast path: staged diff fits comfortably within one request
-        if diff.original_char_count <= budget:
-            self._prepare_diagnostics_plan(
-                diff=diff,
-                budget=budget,
-                split_reasons={"file_boundary": 0, "hunk_boundary": 0, "line_boundary": 0, "oversized_line": 0},
-                chunks=[DiffChunk(chunk_index=1, total_chunks=1, content=diff.raw_diff, files=[f.path for f in diff.files])],
-            )
-            request = build_generation_request(
+        # Pre-flight complete request estimation for single-request fast path
+        tentative_request = build_generation_request(
+            diff=diff,
+            custom_rules=self._custom_rules,
+            recent_commits=self._recent_commits,
+            user_feedback=user_feedback,
+            temperature=temperature,
+            deletion_manifest=status_aware.deletion_manifest,
+        )
+        budget_check = validate_request_budget(tentative_request, context_window=ctx_win)
+
+        # If deletion-only commit and oversized, dynamically compact deletion manifest
+        if not status_aware.eligible_files and status_aware.deleted_files and not budget_check.is_valid:
+            overhead = len(tentative_request.prompt) - len(status_aware.deletion_manifest)
+            avail_chars = max(300, int(budget_check.available_input_tokens * CHARS_PER_TOKEN) - overhead - 200)
+            compact_manifest = format_deletion_manifest(status_aware.deleted_files, max_chars=avail_chars)
+            status_aware = analyze_status_aware_diff(diff, max_manifest_chars=avail_chars)
+            tentative_request = build_generation_request(
                 diff=diff,
                 custom_rules=self._custom_rules,
                 recent_commits=self._recent_commits,
                 user_feedback=user_feedback,
                 temperature=temperature,
+                deletion_manifest=compact_manifest,
+            )
+            budget_check = validate_request_budget(tentative_request, context_window=ctx_win)
+
+        # Fast path requires complete request to fit AND diff content to fit within single_req_budget (or deletion only)
+        can_use_fast_path = budget_check.is_valid and (
+            not status_aware.eligible_files or status_aware.content_char_count <= single_req_budget
+        )
+
+        if can_use_fast_path:
+            chunks = (
+                [DiffChunk(chunk_index=1, total_chunks=1, content=status_aware.content_diff, files=[f.path for f in status_aware.eligible_files])]
+                if status_aware.content_diff
+                else []
+            )
+            self._prepare_diagnostics_plan(
+                diff=diff,
+                budget=single_req_budget,
+                split_reasons={"file_boundary": 0, "hunk_boundary": 0, "line_boundary": 0, "oversized_line": 0},
+                chunks=chunks,
             )
             if on_progress:
                 on_progress(1, 1, "generating")
 
-            response = self._provider.generate(request)
-            self._record_metric("synthesis", response)
+            response = self._provider.generate(tentative_request)
+            self._record_metric("single_request", response, request=tentative_request, check=budget_check)
             return parse_commit_response(response.text)
 
         # Chunked hierarchical generation path
         split_reasons: dict[str, int] = {}
-        chunks = create_diff_chunks(diff, budget, split_reasons=split_reasons)
-        self._prepare_diagnostics_plan(diff, budget, split_reasons, chunks)
-        if len(chunks) == 1:
-            request = build_generation_request(
-                diff=diff,
-                custom_rules=self._custom_rules,
-                recent_commits=self._recent_commits,
-                user_feedback=user_feedback,
-                temperature=temperature,
-            )
+        chunks = create_diff_chunks(diff, chunk_budget, split_reasons=split_reasons)
+        self._prepare_diagnostics_plan(diff, chunk_budget, split_reasons, chunks)
+
+        if len(chunks) <= 1:
+            if len(chunks) == 1:
+                request = build_generation_request(
+                    diff=diff,
+                    custom_rules=self._custom_rules,
+                    recent_commits=self._recent_commits,
+                    user_feedback=user_feedback,
+                    temperature=temperature,
+                    deletion_manifest=status_aware.deletion_manifest,
+                )
+            else:
+                request = build_synthesis_request(
+                    summaries=[],
+                    custom_rules=self._custom_rules,
+                    recent_commits=self._recent_commits,
+                    user_feedback=user_feedback,
+                    temperature=temperature,
+                    deletion_manifest=status_aware.deletion_manifest,
+                )
+            chk = validate_request_budget(request, context_window=ctx_win)
             if on_progress:
                 on_progress(1, 1, "generating")
 
             response = self._provider.generate(request)
-            self._record_metric("synthesis", response)
+            self._record_metric("single_request", response, request=request, check=chk)
             return parse_commit_response(response.text)
 
         # Multi-chunk processing
@@ -469,15 +658,14 @@ class GenerationService:
             on_progress(len(chunks), len(chunks), "synthesizing")
 
         summaries = self._reduce_summaries_if_needed(self._cached_summaries, on_progress=on_progress)
-        synth_req = build_synthesis_request(
+        synth_req, synth_check = self._prepare_synthesis_request(
             summaries=summaries,
-            custom_rules=self._custom_rules,
-            recent_commits=self._recent_commits,
+            status_aware=status_aware,
             user_feedback=user_feedback,
             temperature=temperature,
         )
         synth_resp = self._provider.generate(synth_req)
-        self._record_metric("synthesis", synth_resp)
+        self._record_metric("synthesis", synth_resp, request=synth_req, check=synth_check)
         return parse_commit_response(synth_resp.text)
 
     def stream_commit(
@@ -492,29 +680,60 @@ class GenerationService:
         if not diff.files and diff.original_char_count == 0:
             raise CommitCLIError("Cannot generate commit message: no staged changes provided.")
 
-        budget = self._get_char_budget()
+        ctx_win = self._get_context_window()
+        single_req_budget = self._get_single_request_char_budget()
+        chunk_budget = self._get_chunk_char_budget()
+        status_aware = analyze_status_aware_diff(diff)
 
-        # Fast path: diff fits in single request
-        if diff.original_char_count <= budget:
-            self._prepare_diagnostics_plan(
-                diff=diff,
-                budget=budget,
-                split_reasons={"file_boundary": 0, "hunk_boundary": 0, "line_boundary": 0, "oversized_line": 0},
-                chunks=[DiffChunk(chunk_index=1, total_chunks=1, content=diff.raw_diff, files=[f.path for f in diff.files])],
-            )
-            request = build_generation_request(
+        # Pre-flight complete request estimation for single-request fast path
+        tentative_request = build_generation_request(
+            diff=diff,
+            custom_rules=self._custom_rules,
+            recent_commits=self._recent_commits,
+            user_feedback=user_feedback,
+            temperature=temperature,
+            deletion_manifest=status_aware.deletion_manifest,
+        )
+        budget_check = validate_request_budget(tentative_request, context_window=ctx_win)
+
+        # If deletion-only commit and oversized, dynamically compact deletion manifest
+        if not status_aware.eligible_files and status_aware.deleted_files and not budget_check.is_valid:
+            overhead = len(tentative_request.prompt) - len(status_aware.deletion_manifest)
+            avail_chars = max(300, int(budget_check.available_input_tokens * CHARS_PER_TOKEN) - overhead - 200)
+            compact_manifest = format_deletion_manifest(status_aware.deleted_files, max_chars=avail_chars)
+            status_aware = analyze_status_aware_diff(diff, max_manifest_chars=avail_chars)
+            tentative_request = build_generation_request(
                 diff=diff,
                 custom_rules=self._custom_rules,
                 recent_commits=self._recent_commits,
                 user_feedback=user_feedback,
                 temperature=temperature,
+                deletion_manifest=compact_manifest,
+            )
+            budget_check = validate_request_budget(tentative_request, context_window=ctx_win)
+
+        can_use_fast_path = budget_check.is_valid and (
+            not status_aware.eligible_files or status_aware.content_char_count <= single_req_budget
+        )
+
+        if can_use_fast_path:
+            chunks = (
+                [DiffChunk(chunk_index=1, total_chunks=1, content=status_aware.content_diff, files=[f.path for f in status_aware.eligible_files])]
+                if status_aware.content_diff
+                else []
+            )
+            self._prepare_diagnostics_plan(
+                diff=diff,
+                budget=single_req_budget,
+                split_reasons={"file_boundary": 0, "hunk_boundary": 0, "line_boundary": 0, "oversized_line": 0},
+                chunks=chunks,
             )
             if on_progress:
                 on_progress(1, 1, "generating")
 
             accumulated_parts: list[str] = []
             final_chunk: StreamChunk | None = None
-            for chunk in self._provider.stream(request):
+            for chunk in self._provider.stream(tentative_request):
                 accumulated_parts.append(chunk.text)
                 if chunk.is_done:
                     final_chunk = chunk
@@ -522,7 +741,7 @@ class GenerationService:
                     on_chunk(chunk)
 
             if final_chunk is not None:
-                self._record_metric("synthesis", final_chunk)
+                self._record_metric("single_request", final_chunk, request=tentative_request, check=budget_check)
 
             full_text = "".join(accumulated_parts).strip()
             if not full_text:
@@ -531,16 +750,29 @@ class GenerationService:
 
         # Chunked hierarchical generation path
         split_reasons = {}
-        chunks = create_diff_chunks(diff, budget, split_reasons=split_reasons)
-        self._prepare_diagnostics_plan(diff, budget, split_reasons, chunks)
-        if len(chunks) == 1:
-            request = build_generation_request(
-                diff=diff,
-                custom_rules=self._custom_rules,
-                recent_commits=self._recent_commits,
-                user_feedback=user_feedback,
-                temperature=temperature,
-            )
+        chunks = create_diff_chunks(diff, chunk_budget, split_reasons=split_reasons)
+        self._prepare_diagnostics_plan(diff, chunk_budget, split_reasons, chunks)
+
+        if len(chunks) <= 1:
+            if len(chunks) == 1:
+                request = build_generation_request(
+                    diff=diff,
+                    custom_rules=self._custom_rules,
+                    recent_commits=self._recent_commits,
+                    user_feedback=user_feedback,
+                    temperature=temperature,
+                    deletion_manifest=status_aware.deletion_manifest,
+                )
+            else:
+                request = build_synthesis_request(
+                    summaries=[],
+                    custom_rules=self._custom_rules,
+                    recent_commits=self._recent_commits,
+                    user_feedback=user_feedback,
+                    temperature=temperature,
+                    deletion_manifest=status_aware.deletion_manifest,
+                )
+            chk = validate_request_budget(request, context_window=ctx_win)
             if on_progress:
                 on_progress(1, 1, "generating")
 
@@ -553,7 +785,7 @@ class GenerationService:
                 if on_chunk is not None:
                     on_chunk(chunk)
             if final_chunk is not None:
-                self._record_metric("synthesis", final_chunk)
+                self._record_metric("single_request", final_chunk, request=request, check=chk)
             full_text = "".join(accumulated_parts).strip()
             if not full_text:
                 raise CommitParseError("Generation stream completed without producing any text content.")
@@ -567,10 +799,9 @@ class GenerationService:
             on_progress(len(chunks), len(chunks), "synthesizing")
 
         summaries = self._reduce_summaries_if_needed(self._cached_summaries, on_progress=on_progress)
-        synth_req = build_synthesis_request(
+        synth_req, synth_check = self._prepare_synthesis_request(
             summaries=summaries,
-            custom_rules=self._custom_rules,
-            recent_commits=self._recent_commits,
+            status_aware=status_aware,
             user_feedback=user_feedback,
             temperature=temperature,
         )
@@ -585,7 +816,7 @@ class GenerationService:
                 on_chunk(chunk)
 
         if final_chunk is not None:
-            self._record_metric("synthesis", final_chunk)
+            self._record_metric("synthesis", final_chunk, request=synth_req, check=synth_check)
 
         full_text = "".join(accumulated_parts).strip()
         if not full_text:

@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from commit_cli.diagnostics import ModelDiagnostics
+from commit_cli.git.chunking import DEFAULT_FALLBACK_CONTEXT_WINDOW
 from commit_cli.exceptions import (
     GenerationTimeoutError,
     IncompleteGenerationError,
@@ -128,6 +129,9 @@ class OllamaProvider(BaseLLMProvider):
         3. Model architecture metadata for context_length.
         Caches and aligns the effective context window for subsequent generation requests.
         """
+        if self._detected_num_ctx is not None:
+            return self._detected_num_ctx
+
         # 1. Check environment variable override
         for env_key in ("COMMIT_NUM_CTX", "OLLAMA_NUM_CTX"):
             env_val = os.environ.get(env_key, "").strip()
@@ -186,6 +190,7 @@ class OllamaProvider(BaseLLMProvider):
             pass
 
         if self._detected_num_ctx is None:
+            self._detected_num_ctx = DEFAULT_FALLBACK_CONTEXT_WINDOW
             self._cached_context_reason = "Default fallback context"
             self._cached_context_confidence = "Fallback"
 
@@ -286,6 +291,7 @@ class OllamaProvider(BaseLLMProvider):
         )
 
     def _build_payload(self, request: GenerationRequest, stream: bool) -> dict[str, Any]:
+        effective_ctx = self.get_context_window()
         payload: dict[str, Any] = {
             "model": self._model,
             "prompt": request.prompt,
@@ -293,10 +299,9 @@ class OllamaProvider(BaseLLMProvider):
             "keep_alive": self._keep_alive,
             "options": {
                 "temperature": request.temperature,
+                "num_ctx": effective_ctx,
             },
         }
-        if self._detected_num_ctx is not None:
-            payload["options"]["num_ctx"] = self._detected_num_ctx
         if request.system_prompt:
             payload["system"] = request.system_prompt
         if request.response_schema is not None:

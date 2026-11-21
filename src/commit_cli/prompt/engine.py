@@ -70,21 +70,43 @@ def build_user_prompt(
     custom_rules: str | None = None,
     recent_commits: list[str] | None = None,
     user_feedback: str | None = None,
+    deletion_manifest: str | None = None,
 ) -> str:
     """Construct the structured user prompt from staged changes and context."""
+    from commit_cli.models import FileStatus
+
     sections: list[str] = []
 
-    # 1. Summary of staged files
+    # 1. Summary of staged files (eligible non-deleted files listed individually; deletions summarized to avoid duplication)
+    eligible_files = [f for f in diff.files if f.status != FileStatus.DELETED]
+    deleted_files = [f for f in diff.files if f.status == FileStatus.DELETED]
+
     file_lines = []
-    for f in diff.files:
+    for f in eligible_files:
         status_char = f.status.value
         adds = f"+{f.additions}"
         dels = f"-{f.deletions}"
         bin_marker = " [binary]" if f.is_binary else ""
         file_lines.append(f"- [{status_char}] {f.path} ({adds}/{dels}){bin_marker}")
-    sections.append("STAGED FILES SUMMARY:\n" + "\n".join(file_lines))
 
-    # 2. Custom rules from .commitrules if present
+    if deleted_files:
+        del_count = len(deleted_files)
+        del_word = "file" if del_count == 1 else "files"
+        file_lines.append(f"- [D] {del_count:,} {del_word} deleted (see DELETED FILES manifest below)")
+
+    if file_lines:
+        sections.append("STAGED FILES SUMMARY:\n" + "\n".join(file_lines))
+
+    # 2. Deletion manifest for fully deleted files
+    manifest = deletion_manifest
+    if manifest is None and deleted_files:
+        from commit_cli.git.diff import format_deletion_manifest
+        manifest = format_deletion_manifest(deleted_files)
+
+    if manifest and manifest.strip():
+        sections.append(manifest.strip())
+
+    # 3. Custom rules from .commitrules if present
     if custom_rules and custom_rules.strip():
         sections.append(
             f"=== PROJECT COMMIT RULES (.commitrules) ===\n"
@@ -92,18 +114,23 @@ def build_user_prompt(
             f"=== END PROJECT COMMIT RULES ==="
         )
 
-    # 3. Recent commits for repository style context
+    # 4. Recent commits for repository style context
     if recent_commits:
         examples = "\n".join(f"- {c.strip()}" for c in recent_commits if c.strip())
         if examples:
             sections.append(f"RECENT REPOSITORY COMMITS (STYLE EXAMPLES):\n{examples}")
 
-    # 4. Filtered and sanitized untrusted diff content
-    filtered_diff = filter_diff_noise(diff)
-    sanitized_diff = sanitize_untrusted_diff(filtered_diff)
-    sections.append(f"{DIFF_BOUNDARY_START}\n{sanitized_diff}\n{DIFF_BOUNDARY_END}")
+    # 5. Filtered and sanitized untrusted diff content (excluding deleted file contents)
+    filtered_diff = filter_diff_noise(diff, exclude_deleted=True)
+    if filtered_diff.strip():
+        sanitized_diff = sanitize_untrusted_diff(filtered_diff)
+        sections.append(f"{DIFF_BOUNDARY_START}\n{sanitized_diff}\n{DIFF_BOUNDARY_END}")
+    else:
+        sections.append(
+            f"{DIFF_BOUNDARY_START}\n(No added or modified content diffs - all staged changes are file deletions described in the manifest above.)\n{DIFF_BOUNDARY_END}"
+        )
 
-    # 5. User feedback / guidance (placed after diff for high recency impact)
+    # 6. User feedback / guidance (placed after diff for high recency impact)
     if user_feedback and user_feedback.strip():
         sections.append(
             f"=== USER GUIDANCE / REGENERATION INSTRUCTIONS (MANDATORY) ===\n"
@@ -130,6 +157,7 @@ def build_generation_request(
     user_feedback: str | None = None,
     temperature: float = 0.1,
     max_tokens: int = 600,
+    deletion_manifest: str | None = None,
 ) -> GenerationRequest:
     """Build a complete GenerationRequest ready for the LLM provider."""
     user_prompt = build_user_prompt(
@@ -137,6 +165,7 @@ def build_generation_request(
         custom_rules=custom_rules,
         recent_commits=recent_commits,
         user_feedback=user_feedback,
+        deletion_manifest=deletion_manifest,
     )
     effective_temp = 0.3 if (user_feedback and user_feedback.strip()) else temperature
     return GenerationRequest(
@@ -243,6 +272,7 @@ def build_synthesis_request(
     user_feedback: str | None = None,
     temperature: float = 0.1,
     max_tokens: int = 600,
+    deletion_manifest: str | None = None,
 ) -> GenerationRequest:
     """Build a GenerationRequest to synthesize multiple chunk summaries into one CommitMessage."""
     sections: list[str] = []
@@ -253,8 +283,18 @@ def build_synthesis_request(
         for f in s.files:
             all_files[f.path] = f.change_type
 
-    file_lines = [f"- [{ctype}] {path}" for path, ctype in sorted(all_files.items())]
-    sections.append("COMPLETE STAGED FILES SUMMARY:\n" + "\n".join(file_lines))
+    # Only include non-deleted files in summary when deletion manifest is present separately
+    file_lines = [
+        f"- [{ctype}] {path}"
+        for path, ctype in sorted(all_files.items())
+        if not (deletion_manifest and ctype.lower() in ("deleted", "d"))
+    ]
+    if file_lines:
+        sections.append("COMPLETE STAGED FILES SUMMARY:\n" + "\n".join(file_lines))
+
+    # Deletion manifest as a separate, compact section
+    if deletion_manifest and deletion_manifest.strip():
+        sections.append(deletion_manifest.strip())
 
     # Aggregate changes
     all_func: list[str] = []
@@ -273,20 +313,24 @@ def build_synthesis_request(
     def dedup(items: list[str]) -> list[str]:
         return list(dict.fromkeys(items))
 
-    sections.append("ANALYSIS OF STAGED CHANGES:")
-    if all_func:
-        sections.append("Key Functional Changes:\n" + "\n".join(f"- {x}" for x in dedup(all_func)))
-    if all_api:
-        sections.append("API Changes:\n" + "\n".join(f"- {x}" for x in dedup(all_api)))
-    if all_breaking:
-        sections.append(
-            "Candidate Breaking Changes (Evaluate Evidence - determine if external/public callers are broken):\n"
-            + "\n".join(f"- {x}" for x in dedup(all_breaking))
-        )
-    if all_tests:
-        sections.append("Test Updates:\n" + "\n".join(f"- {x}" for x in dedup(all_tests)))
-    if all_impl:
-        sections.append("Implementation Details:\n" + "\n".join(f"- {x}" for x in dedup(all_impl)))
+    has_chunk_findings = any((all_func, all_api, all_breaking, all_tests, all_impl))
+    if has_chunk_findings:
+        sections.append("ANALYSIS OF STAGED CHANGES:")
+        if all_func:
+            sections.append("Key Functional Changes:\n" + "\n".join(f"- {x}" for x in dedup(all_func)))
+        if all_api:
+            sections.append("API Changes:\n" + "\n".join(f"- {x}" for x in dedup(all_api)))
+        if all_breaking:
+            sections.append(
+                "Candidate Breaking Changes (Evaluate Evidence - determine if external/public callers are broken):\n"
+                + "\n".join(f"- {x}" for x in dedup(all_breaking))
+            )
+        if all_tests:
+            sections.append("Test Updates:\n" + "\n".join(f"- {x}" for x in dedup(all_tests)))
+        if all_impl:
+            sections.append("Implementation Details:\n" + "\n".join(f"- {x}" for x in dedup(all_impl)))
+    elif deletion_manifest:
+        sections.append("ANALYSIS OF STAGED CHANGES:\n- Repository modifications consist of the file removals specified in the deletion manifest.")
 
     if custom_rules and custom_rules.strip():
         sections.append(f"PROJECT COMMIT RULES (.commitrules):\n{custom_rules.strip()}")

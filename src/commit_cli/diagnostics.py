@@ -89,19 +89,45 @@ class ChunkPlanDiagnostics:
 class RequestMetric:
     """Measured and estimated metrics for an individual LLM request."""
 
-    stage: str  # "chunk_analysis", "retry", "reduction", "synthesis"
+    stage: str  # "single_request", "chunk_analysis", "retry", "reduction", "synthesis"
     chunk_index: int | None = None
     file_count: int | None = None
     char_count: int | None = None
-    estimated_tokens: int | None = None
-    prompt_tokens: int | None = None
-    generated_tokens: int | None = None
+
+    # Before-inference estimates (heuristic based on 3.0 chars/token)
+    estimated_input_tokens: int | None = None
+    estimated_prompt_overhead_tokens: int | None = None
+    reserved_output_tokens: int | None = None
+    safety_margin_tokens: int | None = None
+    configured_num_ctx: int | None = None
+    estimated_context_requirement: int | None = None
+    estimated_context_utilization: float | None = None  # estimated_input_tokens / configured_num_ctx
+
+    # After-inference actuals (reported by Ollama provider response)
+    actual_input_tokens: int | None = None  # from prompt_eval_count
+    actual_generated_tokens: int | None = None  # from eval_count
+    actual_input_utilization: float | None = None  # actual_input_tokens / configured_num_ctx
+    actual_request_utilization: float | None = None  # (actual_input_tokens + actual_generated_tokens) / configured_num_ctx
+
     total_duration_sec: float | None = None
     load_duration_sec: float | None = None
     prompt_eval_duration_sec: float | None = None
     eval_duration_sec: float | None = None
     tokens_per_second: float | None = None
     retries: int = 0
+
+    # UI display properties
+    @property
+    def chunk_type(self) -> str:
+        return self.stage
+
+    @property
+    def latency_seconds(self) -> float:
+        return self.total_duration_sec or 0.0
+
+    @property
+    def line_count(self) -> int | None:
+        return None
 
 
 @dataclass
@@ -141,24 +167,35 @@ class GenerationDiagnostics:
         return counts
 
     @property
-    def total_prompt_tokens(self) -> int | None:
-        vals = [m.prompt_tokens for m in self.request_metrics if m.prompt_tokens is not None]
+    def cumulative_actual_input_tokens(self) -> int | None:
+        vals = [m.actual_input_tokens for m in self.request_metrics if m.actual_input_tokens is not None]
         return sum(vals) if vals else None
 
     @property
-    def avg_prompt_tokens(self) -> float | None:
-        vals = [m.prompt_tokens for m in self.request_metrics if m.prompt_tokens is not None]
-        return (sum(vals) / len(vals)) if vals else None
-
-    @property
-    def total_generated_tokens(self) -> int | None:
-        vals = [m.generated_tokens for m in self.request_metrics if m.generated_tokens is not None]
+    def cumulative_actual_generated_tokens(self) -> int | None:
+        vals = [m.actual_generated_tokens for m in self.request_metrics if m.actual_generated_tokens is not None]
         return sum(vals) if vals else None
 
     @property
-    def avg_generated_tokens(self) -> float | None:
-        vals = [m.generated_tokens for m in self.request_metrics if m.generated_tokens is not None]
-        return (sum(vals) / len(vals)) if vals else None
+    def max_actual_input_tokens(self) -> int | None:
+        vals = [m.actual_input_tokens for m in self.request_metrics if m.actual_input_tokens is not None]
+        return max(vals) if vals else None
+
+    @property
+    def peak_observed_request_tokens(self) -> int | None:
+        """Peak observed context consumed across any single request (actual input + actual generated)."""
+        vals = [
+            (m.actual_input_tokens + (m.actual_generated_tokens or 0))
+            for m in self.request_metrics
+            if m.actual_input_tokens is not None
+        ]
+        return max(vals) if vals else None
+
+    @property
+    def max_estimated_context_requirement(self) -> int | None:
+        """Maximum estimated required capacity across any single request."""
+        vals = [m.estimated_context_requirement for m in self.request_metrics if m.estimated_context_requirement is not None]
+        return max(vals) if vals else None
 
     @property
     def total_load_duration_sec(self) -> float:
@@ -177,9 +214,21 @@ class GenerationDiagnostics:
         return sum(m.total_duration_sec for m in self.request_metrics if m.total_duration_sec is not None)
 
     @property
+    def total_latency_seconds(self) -> float:
+        return self.overall_elapsed_sec
+
+    @property
     def avg_tokens_per_second(self) -> float | None:
         speeds = [m.tokens_per_second for m in self.request_metrics if m.tokens_per_second is not None]
         return (sum(speeds) / len(speeds)) if speeds else None
+
+    @property
+    def stop_reasons(self) -> list[str]:
+        return ["stop"] if self.request_metrics else []
+
+    @property
+    def chunk_requests(self) -> list[RequestMetric]:
+        return self.request_metrics
 
 
 def calculate_context_budget_diagnostics(
