@@ -48,8 +48,8 @@ CONVENTIONAL COMMIT RULES:
    - ci: CI/CD configuration
    - chore: maintenance, housekeeping, or tooling
 2. Scope: optional noun representing the module or component (e.g. auth, cli, parser, ui). Omit if changes span multiple unrelated components.
-3. Subject: imperative, present tense ("add", "fix", not "added", "fixes"). Start with lowercase unless an acronym/proper noun. Max 72 chars. Do NOT end with a period.
-4. Body: optional. Use for non-trivial changes: 1-2 sentence summary followed by high-level grouped bullets starting with "- ". Do not list every file individually.
+3. Subject: imperative, present tense ("add", "fix", not "added", "fixes"). Start with lowercase unless an acronym/proper noun. Max 72 chars. Do NOT end with a period. Do NOT repeat the type or scope prefix in the 'subject' field (e.g. write "sanitize JSON escapes", NOT "fix: sanitize JSON escapes").
+4. Body: optional. Use for non-trivial changes: 1-2 sentence summary followed by at most 3 to 7 high-level grouped bullets starting with "- ". Do not list every file individually or output redundant bullets.
 5. Breaking Change: specify ONLY if backwards-incompatible API or behavioral changes exist.
 6. User Instructions & Feedback: When user guidance or feedback is provided, you MUST strictly follow it and incorporate it into the commit message ('subject' or 'body'). For example, if the user asks to mention an author, contributor, attribution, reason, or specific wording, you MUST include that requested detail in the 'body' (or 'subject' if requested). User instructions take precedence over default generic descriptions.
 7. Output ONLY the JSON object. Do not include markdown code block wrappers or conversational commentary.
@@ -230,11 +230,12 @@ CONVENTIONAL COMMIT RULES:
 1. Synthesize the overall unified purpose across ALL analyzed files and changes into ONE coherent commit message.
 2. Type must be one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
 3. Scope: module or component if focused, or null if cross-cutting.
-4. Subject: imperative, lowercase start, max 72 chars, no trailing period.
-5. Body: group key functional changes into concise bullets starting with "- ". Avoid redundant bullet points.
+4. Subject: imperative, lowercase start, max 72 chars, no trailing period. Do NOT repeat the type or scope prefix in the 'subject' field (e.g. write "sanitize JSON escapes", NOT "fix: sanitize JSON escapes").
+5. Body: group key functional changes into concise bullets starting with "- ". Limit to at most 3 to 7 high-level, grouped bullet points. NEVER list every file or repetitive change individually. Be concise.
 6. Breaking Change: candidate breaking change observations must be critically evaluated. Specify breaking_change ONLY if there are genuine backwards-incompatible changes affecting external consumers or public APIs/interfaces. Internal refactorings, private function or method modifications, or internal implementation changes that do not break external contracts MUST NOT produce a breaking change (set breaking_change to null).
 7. User Instructions & Feedback: When user guidance or feedback is provided, you MUST strictly follow it and incorporate it into the commit message ('subject' or 'body'). For example, if the user asks to mention an author, contributor, attribution, reason, or specific wording, you MUST include that requested detail in the 'body' (or 'subject' if requested). User instructions take precedence over default generic descriptions.
 8. Output ONLY the JSON object. Do not include markdown code block wrappers or conversational commentary.
+9. Keep the total output concise so the complete JSON object finishes comfortably within output token limits.
 """
 
 
@@ -271,7 +272,7 @@ def build_synthesis_request(
     recent_commits: list[str] | None = None,
     user_feedback: str | None = None,
     temperature: float = 0.1,
-    max_tokens: int = 600,
+    max_tokens: int = 800,
     deletion_manifest: str | None = None,
 ) -> GenerationRequest:
     """Build a GenerationRequest to synthesize multiple chunk summaries into one CommitMessage."""

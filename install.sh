@@ -194,6 +194,7 @@ fi
 # 6. Create / Update Isolated Virtual Environment
 # ------------------------------------------------------------------------------
 mkdir -p "$APP_DATA_DIR"
+echo "$PROJECT_DIR" > "$APP_DATA_DIR/source_path"
 
 if [[ -d "$VENV_DIR" && -x "$VENV_DIR/bin/python" ]]; then
     echo "==> Existing isolated environment detected at $VENV_DIR"

@@ -74,6 +74,7 @@ def run_guided_review_loop(
 
     r_state = repo_state or get_repo_state(repo_root)
     gen_duration = generation_duration_seconds
+    accumulated_feedback: list[str] = []
 
     while True:
         if preset == "rich":
@@ -212,6 +213,10 @@ def run_guided_review_loop(
 
         elif review_choice == CommitReviewChoice.REGENERATE:
             feedback = prompt_txt("Regeneration feedback / instructions (optional):", preset=preset)
+            if feedback and feedback.strip():
+                accumulated_feedback.append(feedback.strip())
+
+            combined_feedback = "\n".join(f"- {f}" for f in accumulated_feedback) if accumulated_feedback else None
             new_candidate, new_duration = generator(
                 service=service,
                 snapshot=snapshot,
@@ -220,7 +225,7 @@ def run_guided_review_loop(
                 preset=preset,
                 stdout_mode=False,
                 model_name=cfg.model,
-                user_feedback=feedback if feedback and feedback.strip() else None,
+                user_feedback=combined_feedback,
                 debug_generation=debug_generation,
                 repo_state=r_state,
                 cfg=cfg,

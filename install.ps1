@@ -166,6 +166,7 @@ try {
 if (-not (Test-Path $AppDataDir)) {
     New-Item -ItemType Directory -Path $AppDataDir -Force | Out-Null
 }
+Set-Content -Path (Join-Path $AppDataDir "source_path") -Value $PSScriptRoot -Force
 
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 

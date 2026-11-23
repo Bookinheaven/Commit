@@ -69,6 +69,54 @@ def validate_commit_message(msg: CommitMessage) -> None:
         )
 
 
+def _sanitize_json_escapes(s: str) -> str:
+    """Sanitize invalid escape sequences that LLMs occasionally output."""
+    # Convert \xHH to unicode character
+    s = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+    # Replace invalid single backslashes (not followed by ", \, /, b, f, n, r, t, u)
+    s = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", s)
+    return s
+
+
+def _repair_truncated_json(clean: str) -> dict[str, Any] | None:
+    """Attempt to repair JSON truncated by model output token limits.
+
+    When generation halts mid-string (e.g. within body), this removes incomplete
+    trailing bullet lines or words and closes the open string and root object.
+    """
+    first_brace = clean.find("{")
+    if first_brace == -1:
+        return None
+    candidate = clean[first_brace:]
+    if '"type"' not in candidate or '"subject"' not in candidate:
+        return None
+
+    candidate = _sanitize_json_escapes(candidate)
+
+    # If truncated inside body or string, strip back to last newline (escaped \n or raw \n)
+    last_nl = max(candidate.rfind(r"\n"), candidate.rfind("\n"))
+    if last_nl != -1:
+        prefix = candidate[:last_nl].rstrip().rstrip(",")
+        for closing in ['"\n}', '"}', '\n}', '}']:
+            try:
+                data = json.loads(prefix + closing, strict=False)
+                if isinstance(data, dict) and "type" in data and "subject" in data:
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Try standard string and object terminations
+    for closing in ['"\n}', '"}', '\n}', '}']:
+        try:
+            data = json.loads(candidate + closing, strict=False)
+            if isinstance(data, dict) and "type" in data and "subject" in data:
+                return data
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Attempt to extract and parse a JSON object from text."""
     clean = text.strip()
@@ -80,9 +128,9 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
             lines = lines[:-1]
         clean = "\n".join(lines).strip()
 
-    # Direct JSON parse (strict RFC 8259 compliance)
+    # Direct JSON parse
     try:
-        data = json.loads(clean)
+        data = json.loads(clean, strict=False)
         if isinstance(data, dict):
             return data
     except (json.JSONDecodeError, TypeError):
@@ -94,11 +142,16 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         candidate = clean[first_brace : last_brace + 1]
         try:
-            data = json.loads(candidate)
+            data = json.loads(candidate, strict=False)
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, TypeError):
             pass
+
+    # Attempt to recover truncated JSON if model hit token limits
+    repaired = _repair_truncated_json(clean)
+    if repaired is not None:
+        return repaired
 
     return None
 
@@ -204,6 +257,20 @@ def parse_commit_response(response_text: str) -> CommitMessage:
         raw_subject = str(json_data.get("subject", "")).strip().rstrip(".")
         if not raw_subject:
             raise CommitValidationError("Commit subject cannot be empty.")
+
+        # Strip redundant type/scope prefixes if the model included them inside the subject field
+        while True:
+            prefix_match = CONVENTIONAL_TITLE_PATTERN.match(raw_subject)
+            if prefix_match:
+                sub_type = prefix_match.group(1).lower()
+                sub_scope = prefix_match.group(2)
+                sub_text = prefix_match.group(4).strip().rstrip(".")
+                if sub_type in [t.value for t in CommitType]:
+                    if not scope and sub_scope:
+                        scope = sub_scope.strip()
+                    raw_subject = sub_text
+                    continue
+            break
 
         # 4. Body
         raw_body = json_data.get("body")

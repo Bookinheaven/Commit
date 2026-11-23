@@ -174,12 +174,21 @@ Commit is installed into an isolated virtual environment under your user applica
 
 ### Upgrading
 
-To update Commit to a new version, pull or extract the updated source and re-run the installer:
+You can update Commit in place at any time using the built-in update command:
 
-- **Linux & macOS**: `./install.sh`
-- **Windows**: `install.bat`
+```bash
+# Check if an update is available
+commit update --check
 
-The installer detects your existing isolated environment and upgrades Commit and its dependencies in place.
+# Perform in-place upgrade
+commit update
+```
+
+Alternatively, if you are updating from a cloned source repository:
+- **Linux & macOS**: `./update.sh` (or `./install.sh`)
+- **Windows**: `update.bat` (or `install.bat`)
+
+The updater pulls the latest commits from the repository and upgrades Commit and its dependencies inside the isolated virtual environment in place.
 
 ---
 
@@ -380,6 +389,7 @@ Options:
 Commands:
   doctor                  Run environment, Git, and configuration diagnostics.
   config                  Inspect and modify Commit configuration settings.
+  update                  Check for or perform an in-place upgrade of Commit.
 ```
 
 ---

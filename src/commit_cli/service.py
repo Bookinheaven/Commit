@@ -658,6 +658,8 @@ class GenerationService:
             on_progress(len(chunks), len(chunks), "synthesizing")
 
         summaries = self._reduce_summaries_if_needed(self._cached_summaries, on_progress=on_progress)
+        if on_progress:
+            on_progress(len(chunks), len(chunks), "synthesizing")
         synth_req, synth_check = self._prepare_synthesis_request(
             summaries=summaries,
             status_aware=status_aware,
@@ -799,6 +801,8 @@ class GenerationService:
             on_progress(len(chunks), len(chunks), "synthesizing")
 
         summaries = self._reduce_summaries_if_needed(self._cached_summaries, on_progress=on_progress)
+        if on_progress:
+            on_progress(len(chunks), len(chunks), "synthesizing")
         synth_req, synth_check = self._prepare_synthesis_request(
             summaries=summaries,
             status_aware=status_aware,

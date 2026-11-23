@@ -261,6 +261,19 @@ def doctor_command() -> None:
     console.print()
 
 
+@app.command(name="update")
+def update_command(
+    check: bool = typer.Option(False, "--check", "-c", help="Check for available updates without installing."),
+    force: bool = typer.Option(False, "--force", "-f", help="Force reinstallation of dependencies."),
+) -> None:
+    """Check for or perform an in-place upgrade of Commit."""
+    from commit_cli.updater import run_update
+
+    code = run_update(check_only=check, force=force, console=console)
+    if code != 0:
+        raise typer.Exit(code=code)
+
+
 def is_stdin_interactive() -> bool:
     """Check if standard input is an interactive terminal."""
     return sys.stdin.isatty()

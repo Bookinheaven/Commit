@@ -39,6 +39,10 @@ if [[ -d "$VENV_DIR" ]]; then
     REMOVED_ANY=1
 fi
 
+if [[ -f "$APP_DATA_DIR/source_path" ]]; then
+    rm -f "$APP_DATA_DIR/source_path"
+fi
+
 if [[ -d "$APP_DATA_DIR" ]] && [[ -z "$(ls -A "$APP_DATA_DIR" 2>/dev/null)" ]]; then
     rmdir "$APP_DATA_DIR" 2>/dev/null || true
 fi
