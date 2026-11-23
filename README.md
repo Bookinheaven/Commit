@@ -19,6 +19,8 @@ Commit inspects your staged Git changes, understands your project structure and 
 - **Interactive Review & Editing**:
   - One-key commit (<kbd>Enter</kbd>), edit (<kbd>e</kbd>), regenerate (<kbd>r</kbd>), or cancel (<kbd>q</kbd> / <kbd>Esc</kbd>).
   - Structured field-by-field editing or external editor launching (`$EDITOR`, `nvim`, `code --wait`, `nano`, `vim`).
+  - **Cumulative Feedback**: Feedback accumulates across regeneration rounds so that multiple refinement instructions are unified without discarding previously analyzed changes.
+  - **Resilient Parsing**: Automatic recovery and repair for truncated model responses, JSON escape sanitization, and automatic deduplication of type and scope prefixes.
 - **Git Safety Guarantees**:
   - Computes a SHA-256 snapshot fingerprint of staged changes and HEAD to detect any changes made while reviewing.
   - Analyzes only staged changes (`git diff --cached`).
@@ -177,18 +179,21 @@ Commit is installed into an isolated virtual environment under your user applica
 You can update Commit in place at any time using the built-in update command:
 
 ```bash
-# Check if an update is available
+# Check if an update is available without installing
 commit update --check
 
 # Perform in-place upgrade
 commit update
+
+# Force reinstallation even if already up to date
+commit update --force
 ```
 
 Alternatively, if you are updating from a cloned source repository:
 - **Linux & macOS**: `./update.sh` (or `./install.sh`)
-- **Windows**: `update.bat` (or `install.bat`)
+- **Windows**: `update.bat` or `.\update.ps1` (or `install.bat` / `.\install.ps1`)
 
-The updater pulls the latest commits from the repository and upgrades Commit and its dependencies inside the isolated virtual environment in place.
+The updater detects whether your local source or remote Git repository has new commits, checks if your working tree has uncommitted edits, and tracks the installed commit SHA. If everything is up to date, it exits cleanly without unnecessary reinstalls.
 
 ---
 
@@ -295,7 +300,7 @@ Commit supports exactly two appearance modes:
   commit config set ui.appearance rich
   ```
 
-*(Note: Standard mode has been completely removed in Commit 0.1.0 in favor of the fast Minimal default and immersive Rich mode).*
+*(Note: Standard mode has been completely removed in Commit 0.1.x in favor of the fast Minimal default and immersive Rich mode).*
 
 ---
 
@@ -450,49 +455,53 @@ Generation diagnostics displays:
 
 ## Manual Verification Checklist
 
-Developers and contributors can use this manual checklist to verify Commit 0.1.0:
+Developers and contributors can use this manual checklist to verify Commit 0.1.1:
 
 ```bash
 # 1. Fresh Installation Verification
-./install.sh --no-path  # On Windows: install.bat
-commit --version        # Should output: commit-ai version 0.1.0
-commit --help           # Should list --appearance (minimal, rich)
+./install.sh --no-path  # On Windows: install.bat or .\install.ps1
+commit --version        # Should output: commit-ai version 0.1.1
+commit --help           # Should list --appearance (minimal, rich) and update command
 commit doctor           # Should report environment, git, and config health
 
-# 2. Appearance Preset Checks
+# 2. In-Place Update Verification
+commit update --check   # Should report whether an update is available
+commit update           # Should report 'Commit is already up to date' if no changes
+
+# 3. Appearance Preset Checks
 commit config show                    # Verify UI Appearance defaults to 'Minimal'
 commit --appearance standard          # Must be rejected: Error: Invalid appearance preset 'standard'
 commit --appearance rich --dry-run    # Verify full-screen Rich interface initializes
 commit --appearance minimal --dry-run # Verify in-place stream Minimal interface initializes
 
-# 3. Local Ollama Connectivity & Generation
+# 4. Local Ollama Connectivity & Generation
 ollama list                           # Verify model is available (e.g. qwen2.5-coder:7b)
 git add <file>
 commit --dry-run                      # Verify message generates and renders preview
 
-# 4. Stdout Pipeline Check
+# 5. Stdout Pipeline Check
 commit --stdout                       # Should output ONLY the generated commit message text
 
-# 5. Interactive Review: Edit, Regenerate, Cancel
+# 6. Interactive Review: Edit, Regenerate, Cancel
 commit
 # In review menu:
 # - Press 'e': Verify structured or external editor opens and updates the message.
-# - Press 'r': Verify prompt accepts optional feedback and regenerates a new message.
+# - Press 'r': Verify prompt accepts optional feedback, accumulates instructions across rounds, and regenerates.
 # - Press 'q' or Esc: Verify application exits cleanly without committing.
 
-# 6. Successful Commit Verification
+# 7. Successful Commit Verification
 commit
 # Press Enter to commit. Run 'git log -1' to verify commit was made with hooks/signing.
 
-# 7. Stale Staged Snapshot Handling
+# 8. Stale Staged Snapshot Handling
 commit
 # While review prompt is open, in another terminal stage an additional change:
 # git add <other-file>
 # Return to Commit and press Enter:
 # Verify Commit detects the index mismatch, aborts, and offers to refresh/regenerate.
 
-# 8. Uninstallation Check
-./uninstall.sh          # On Windows: uninstall.bat
+# 9. Uninstallation Check
+./uninstall.sh          # On Windows: uninstall.bat or .\uninstall.ps1
 which commit            # Should report not found (or removed launcher)
 ```
 
