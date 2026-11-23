@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "commit-ai"
-version = "0.1.1"
+dynamic = ["version"]
 description = "AI-powered Conventional Commit message generator"
 readme = "README.md"
 license = "MIT"
@@ -41,3 +41,6 @@ commit = "commit_cli.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/commit_cli"]
+
+[tool.hatch.version]
+path = "src/commit_cli/__init__.py"
