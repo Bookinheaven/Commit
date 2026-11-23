@@ -34,6 +34,29 @@ def get_recorded_source_path() -> Path | None:
     return None
 
 
+def get_installed_commit() -> str:
+    """Return the Git commit SHA recorded during last install or update."""
+    marker = get_app_data_dir() / "installed_commit"
+    if marker.is_file():
+        try:
+            return marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def record_installed_commit(commit_sha: str) -> None:
+    """Record Git commit SHA of currently installed version."""
+    if not commit_sha:
+        return
+    try:
+        app_dir = get_app_data_dir()
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "installed_commit").write_text(commit_sha.strip(), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def discover_source_directory() -> Path | None:
     """Discover local source repository directory if available."""
     # 1. Check current working directory
@@ -122,7 +145,37 @@ def run_update(
                 c.print("\n[green]Commit is already up to date.[/green]")
                 return 0
 
-        # Pull if in git repo and not forced local-only
+        # Check if local installation is already completely up to date
+        if is_git_repo and not new_commits_available and not force:
+            head_sha_res = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            current_head = head_sha_res.stdout.strip() if head_sha_res.returncode == 0 else ""
+            installed_commit = get_installed_commit()
+
+            # Check if there are uncommitted source modifications in src/ or pyproject.toml
+            status_res = subprocess.run(
+                ["git", "status", "--porcelain", "src", "pyproject.toml"],
+                cwd=source_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            has_source_changes = bool(status_res.stdout.strip())
+
+            # If commit SHA matches and no uncommitted changes in source code
+            if current_head and not has_source_changes and installed_commit == current_head:
+                c.print(f"\n[bold green]✓ Commit is already up to date![/bold green] (Active version: [bold cyan]{__version__}[/bold cyan])")
+                c.print("[dim]No updates required. Use 'commit update --force' to force reinstallation.[/dim]\n")
+                return 0
+            elif has_source_changes:
+                c.print("[yellow]Notice:[/yellow] Local modifications detected in source repository.")
+
+        # Pull if in git repo and new commits available
         if is_git_repo and new_commits_available:
             c.print("==> Pulling latest changes from remote Git repository...")
             pull_res = subprocess.run(
@@ -146,6 +199,17 @@ def run_update(
         if install_res.returncode != 0:
             c.print(f"[bold red]Error: Failed to upgrade Commit (exit code {install_res.returncode}).[/bold red]")
             return 1
+
+        if is_git_repo:
+            head_res = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if head_res.returncode == 0:
+                record_installed_commit(head_res.stdout.strip())
 
     # Case 2: Updating directly from official remote Git repository
     else:
