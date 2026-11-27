@@ -426,10 +426,16 @@ def prompt_select(
 ) -> Any:
     """Prompt user to select from a list of choices with cancellation safety."""
     check_terminal_interactive()
+    normalized_choices = [
+        questionary.Choice(title=choice[0], value=choice[1])
+        if isinstance(choice, tuple) and len(choice) == 2
+        else choice
+        for choice in choices
+    ]
     try:
         return questionary.select(
             message,
-            choices=choices,
+            choices=normalized_choices,
             default=default,
             style=get_questionary_style(preset),
             use_indicator=True,
